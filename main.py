@@ -15,8 +15,10 @@ import sys
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 
-from scraper.browser import new_page
+from scraper.browser import new_page, new_page_for_computer_use
+from scraper.computer_use import scrape_city_computer_use
 from scraper.extractor import scrape_city
 from scraper.export import to_csv
 from scraper.models import PriceRecord
@@ -25,6 +27,32 @@ from scraper.models import PriceRecord
 def load_config(path: str = "config/targets.yaml") -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+async def run_computer_use(
+    cities: list[str],
+    headless: bool,
+    max_locations: int,
+) -> list[PriceRecord]:
+    all_records: list[PriceRecord] = []
+
+    async with new_page_for_computer_use(headless=headless) as page:
+        for city in cities:
+            print(f"\n{'='*60}")
+            print(f"  Scraping (Computer Use): {city}")
+            print(f"{'='*60}")
+            try:
+                records = await scrape_city_computer_use(
+                    page=page,
+                    city=city,
+                    max_locations=max_locations,
+                )
+                all_records.extend(records)
+                print(f"  → {len(records)} price record(s) collected for {city}")
+            except Exception as e:
+                print(f"  [ERROR] Failed to scrape {city}: {e}")
+
+    return all_records
 
 
 async def run(cities: list[str], headless: bool, delay: float, max_locations: int) -> list[PriceRecord]:
@@ -51,6 +79,7 @@ async def run(cities: list[str], headless: bool, delay: float, max_locations: in
 
 
 def main() -> None:
+    load_dotenv()
     parser = argparse.ArgumentParser(description="Scrape Bounce competitor pricing")
     parser.add_argument(
         "--city",
@@ -79,6 +108,12 @@ def main() -> None:
         help="Max locations per city (0 = unlimited)",
     )
     parser.add_argument(
+        "--mode",
+        choices=["playwright", "computer-use"],
+        default="playwright",
+        help="Scraping mode: playwright (default) uses API/DOM tiers; computer-use uses Claude visual AI",
+    )
+    parser.add_argument(
         "--output-dir",
         default="output",
         help="Directory for CSV output (default: output/)",
@@ -91,6 +126,7 @@ def main() -> None:
     delay = scraper_cfg.get("delay_between_locations", 2)
     max_locs = args.max_locations or scraper_cfg.get("max_locations_per_city", 0)
     headless = args.headless
+    mode = args.mode
 
     if args.all_cities:
         cities = config.get("cities", [])
@@ -107,9 +143,12 @@ def main() -> None:
 
     print(f"Target: {config['competitor']['name']} ({config['competitor']['url']})")
     print(f"Cities: {', '.join(cities)}")
-    print(f"Headless: {headless} | Delay: {delay}s | Max locations: {max_locs or 'unlimited'}")
-
-    records = asyncio.run(run(cities, headless=headless, delay=delay, max_locations=max_locs))
+    if mode == "computer-use":
+        print(f"Mode: computer-use | Headless: {headless} | Max locations: {max_locs or 'unlimited'}")
+        records = asyncio.run(run_computer_use(cities, headless=headless, max_locations=max_locs))
+    else:
+        print(f"Mode: playwright | Headless: {headless} | Delay: {delay}s | Max locations: {max_locs or 'unlimited'}")
+        records = asyncio.run(run(cities, headless=headless, delay=delay, max_locations=max_locs))
 
     city_label = cities[0] if len(cities) == 1 else ""
     to_csv(records, output_dir=args.output_dir, city=city_label)

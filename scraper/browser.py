@@ -4,7 +4,6 @@ Playwright browser session factory.
 Uses playwright-stealth to mask automation fingerprints and reduce
 the chance of being detected/blocked by Cloudflare or similar.
 """
-import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -41,6 +40,38 @@ async def new_page(headless: bool = True) -> AsyncGenerator[Page, None]:
             user_agent=_USER_AGENT,
             viewport={"width": 1440, "height": 900},
             locale="en-GB",
+        )
+        page: Page = await context.new_page()
+        await stealth_async(page)
+        try:
+            yield page
+        finally:
+            await context.close()
+            await browser.close()
+
+
+@asynccontextmanager
+async def new_page_for_computer_use(headless: bool = True) -> AsyncGenerator[Page, None]:
+    """
+    Async context manager yielding a Page configured for the Computer Use API.
+
+    The viewport is exactly 1280x800 to match the COMPUTER_TOOL declared dimensions.
+    Coordinates from Claude will only be accurate if the browser and tool share the same size.
+    """
+    async with async_playwright() as pw:
+        browser: Browser = await pw.chromium.launch(
+            headless=headless,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--force-device-scale-factor=1",
+            ],
+        )
+        context: BrowserContext = await browser.new_context(
+            user_agent=_USER_AGENT,
+            viewport={"width": 1280, "height": 800},
+            locale="en-GB",
+            color_scheme="light",
         )
         page: Page = await context.new_page()
         await stealth_async(page)
