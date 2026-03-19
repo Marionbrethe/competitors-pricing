@@ -10,6 +10,7 @@ Requires ANTHROPIC_API_KEY in the environment (or a .env file at the project roo
 Usage:
     python main.py --city "London" --mode computer-use
 """
+import asyncio
 import base64
 import os
 import time
@@ -30,7 +31,7 @@ TOOL_VERSION = "computer_20251124"
 BETA_HEADER = "computer-use-2025-11-24"
 VIEWPORT_WIDTH = 1280
 VIEWPORT_HEIGHT = 800
-MAX_ITERATIONS = 50
+MAX_ITERATIONS = 25
 REPORT_TOOL_NAME = "report_pricing_data"
 # Keep this many recent user turns with full screenshots; older turns get images stripped
 SCREENSHOT_HISTORY_TURNS = 3
@@ -93,35 +94,41 @@ REPORT_TOOL: dict[str, Any] = {
 # Task prompt
 # ---------------------------------------------------------------------------
 
-def _build_task_prompt(city: str, max_locations: int) -> str:
+def _city_slug(city: str) -> str:
+    return city.strip().lower().replace(" ", "-")
+
+
+def _build_task_prompt(city: str, max_locations: int, city_url: str) -> str:
     limit_clause = (
         f"Collect up to {max_locations} locations."
         if max_locations > 0
         else "Collect all available locations on the page."
     )
-    return f"""You are scraping the Bounce luggage storage website (https://www.usebounce.com) for pricing data in {city}.
+    return f"""The browser is already open and has been navigated to the Bounce luggage storage page for {city}:
+  {city_url}
 
-Your task:
-1. The browser is already open. Take a screenshot to see the current page state.
-2. Navigate to https://www.usebounce.com if you are not already there.
-3. Find the search bar (usually has placeholder text like "Where are you going?" or "Search location").
-4. Type "{city}" into the search bar and select the first autocomplete suggestion.
-5. Wait for the search results to load — you will see a list of storage location cards.
-6. For each location card visible on screen:
-   a. Click on the location card to open its detail panel or page.
-   b. Find the bag size pricing section (it shows sizes like Small, Regular, Odd-sized or Oversized, each with a price per day such as "£15.00 / day").
-   c. Record the location name, address, each bag size, and its price.
-   d. Navigate back to the results list (use the back button or close button).
-   e. Scroll down if needed to find more locations.
-7. {limit_clause}
-8. When you have collected all pricing data, call the `{REPORT_TOOL_NAME}` tool with all records.
+Take a screenshot first to see what is currently on screen.
 
-Important notes:
-- Prices are shown as e.g. "£15.00 / day" — extract the numeric value, currency symbol (convert to ISO: £→GBP, $→USD, €→EUR), and unit.
-- If a location shows no pricing panel, skip it.
-- Do not fill in booking forms or click "Book now" buttons.
-- If you encounter a cookie consent banner, dismiss it first by clicking the accept/close button.
+Your task — extract pricing from each storage location card on this page:
+
+1. If you see a cookie consent banner, dismiss it by clicking the accept/close button.
+2. You should see a list of storage location cards on the left side of the page.
+   - Each card shows a location name and address.
+3. For each card:
+   a. Click the card to open its detail panel (appears on the right, or as a new page).
+   b. Find the bag size section — it lists sizes like Small, Regular, Odd-sized, or Oversized, each with a price like "£15.00 / day".
+   c. Record the location name, address, every bag size, and its price.
+   d. Go back to the location list (click the back arrow or close the panel).
+   e. Scroll down to reveal more cards if needed.
+4. {limit_clause}
+5. When finished, call the `{REPORT_TOOL_NAME}` tool with all collected records.
+
+Rules:
+- Prices look like "£15.00 / day" — extract the number, convert the currency symbol (£→GBP, $→USD, €→EUR), and the unit (day).
+- Skip any location that has no pricing shown.
+- Do NOT click "Book now" or fill in any booking form.
 - Call `{REPORT_TOOL_NAME}` even if you found zero locations.
+- Do not navigate away from this site.
 """
 
 
@@ -292,6 +299,7 @@ async def _run_agent_loop(
     page: Page,
     city: str,
     max_locations: int,
+    city_url: str,
 ) -> list[PriceRecord]:
     """
     Run the Computer Use agent loop for one city.
@@ -300,7 +308,7 @@ async def _run_agent_loop(
     MAX_ITERATIONS is reached, or an unrecoverable API error occurs.
     """
     messages: list[dict] = [
-        {"role": "user", "content": _build_task_prompt(city, max_locations)}
+        {"role": "user", "content": _build_task_prompt(city, max_locations, city_url)}
     ]
     # Accumulates records reported mid-session (e.g. per-location tool calls in future)
     partial_records: list[PriceRecord] = []
@@ -448,9 +456,19 @@ async def scrape_city_computer_use(
 
     client = anthropic.Anthropic(api_key=api_key)
 
+    # Navigate directly to the city page before starting the agent —
+    # this skips the search-bar flow and saves ~10 iterations.
+    city_url = f"https://www.usebounce.com/luggage-storage/{_city_slug(city)}"
+    print(f"[{city}] Pre-navigating to {city_url}")
+    try:
+        await page.goto(city_url, wait_until="domcontentloaded", timeout=30_000)
+        await asyncio.sleep(3)  # let JS render the location cards
+    except Exception as nav_exc:
+        print(f"[{city}] Pre-navigation failed ({nav_exc}) — agent will navigate manually")
+
     print(f"[{city}] Using Computer Use API (model: {MODEL})")
     try:
-        records = await _run_agent_loop(client, page, city, max_locations)
+        records = await _run_agent_loop(client, page, city, max_locations, city_url)
     except Exception as exc:
         print(f"  [CU] Agent loop failed for {city}: {exc}")
         return []
