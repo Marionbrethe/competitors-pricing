@@ -11,13 +11,15 @@
 1. [What this tool does](#1-what-this-tool-does)
 2. [What you get out of it](#2-what-you-get-out-of-it)
 3. [How it works under the hood](#3-how-it-works-under-the-hood)
-4. [Prerequisites — what you need before starting](#4-prerequisites--what-you-need-before-starting)
-5. [Step-by-step setup guide](#5-step-by-step-setup-guide)
-6. [Running the scraper](#6-running-the-scraper)
-7. [Understanding the output](#7-understanding-the-output)
-8. [Configuring cities and settings](#8-configuring-cities-and-settings)
-9. [Troubleshooting](#9-troubleshooting)
-10. [Limitations and known constraints](#10-limitations-and-known-constraints)
+4. [Tech stack](#4-tech-stack)
+5. [Method comparison: playwright vs computer-use](#5-method-comparison-playwright-vs-computer-use)
+6. [Prerequisites — what you need before starting](#6-prerequisites--what-you-need-before-starting)
+7. [Step-by-step setup guide](#7-step-by-step-setup-guide)
+8. [Running the scraper](#8-running-the-scraper)
+9. [Understanding the output](#9-understanding-the-output)
+10. [Configuring cities and settings](#10-configuring-cities-and-settings)
+11. [Troubleshooting](#11-troubleshooting)
+12. [Limitations and known constraints](#12-limitations-and-known-constraints)
 
 ---
 
@@ -61,7 +63,42 @@ If the standard mode is blocked by the website, this mode uses Claude (Anthropic
 
 ---
 
-## 4. Prerequisites — what you need before starting
+## 4. Tech stack
+
+| Layer | Technology | Version | Role |
+|---|---|---|---|
+| **Language** | Python | 3.11+ | Core runtime |
+| **Browser automation** | Playwright | ≥ 1.47 | Controls a real Chromium browser for scraping |
+| **Bot evasion** | playwright-stealth | 1.0.6 | Makes the automated browser look more human-like to avoid Cloudflare blocks |
+| **AI vision & control** | Anthropic Claude API (`claude-claude-sonnet-4-6`) | ≥ 0.40 | Powers the `computer-use` mode — looks at screenshots and controls the browser |
+| **Data validation** | Pydantic | ≥ 2.9 | Validates and structures the scraped pricing data |
+| **Data export** | pandas | ≥ 2.2 | Writes results to CSV |
+| **Configuration** | PyYAML | ≥ 6.0 | Reads `config/targets.yaml` |
+| **Secrets management** | python-dotenv | ≥ 1.0 | Loads the `ANTHROPIC_API_KEY` from the `.env` file |
+| **Browser engine** | Chromium (via Playwright) | latest | The actual browser that visits the Bounce website |
+
+---
+
+## 5. Method comparison: `playwright` vs `computer-use`
+
+| Dimension | `playwright` (default) | `computer-use` (AI-powered) |
+|---|---|---|
+| **How it works** | Reads the HTML/DOM of the page directly | Takes screenshots and uses Claude AI to interpret what's on screen and decide what to click |
+| **Speed** | Fast — ~5–10 seconds per location | Slow — ~2–5 minutes per location |
+| **Time for a city with 20 locations** | ~2–4 minutes | ~40–100 minutes |
+| **Cost** | Free (no API calls) | Paid — $0.50–$2.00 per city (Anthropic API billed per token) |
+| **Bot detection risk** | Higher — structured DOM queries are easier for Cloudflare to detect | Lower — behaves more like a real human looking at a screen |
+| **Reliability** | May fail if the website blocks the scraper or changes its HTML structure | More resilient to layout changes; falls back gracefully |
+| **Requires API key** | No | Yes (`ANTHROPIC_API_KEY`) |
+| **Headless by default** | Yes (invisible browser) | Yes (invisible browser) |
+| **Best for** | Routine, regular scrapes of many cities | One-off scrapes when `playwright` is blocked |
+| **Run command** | `python main.py --city "London"` | `python main.py --city "London" --mode computer-use` |
+
+> **Rule of thumb:** Start with `playwright`. If you get 0 results or errors, switch to `computer-use`.
+
+---
+
+## 6. Prerequisites — what you need before starting
 
 You need three things installed on your computer:
 
@@ -93,7 +130,7 @@ If you see something like `git version 2.39.0`, you're good. If not, download Gi
 
 ---
 
-## 5. Step-by-step setup guide
+## 7. Step-by-step setup guide
 
 > **What is a terminal?**
 > It's a text-based window where you type commands. On a Mac, press `Cmd + Space`, type `Terminal`, and press Enter. On Windows, press the Windows key, type `cmd`, and press Enter.
@@ -165,7 +202,7 @@ echo ANTHROPIC_API_KEY=sk-ant-api03-YOUR-KEY-HERE > .env
 
 ---
 
-## 6. Running the scraper
+## 8. Running the scraper
 
 All commands below are typed in your terminal, from inside the `competitors-pricing` folder.
 
@@ -225,7 +262,7 @@ This scrapes London and Paris, collects up to 5 locations each, and shows the br
 
 ---
 
-## 7. Understanding the output
+## 9. Understanding the output
 
 After running, you'll find a file in the `output/` folder. The filename includes the city name and today's date, for example:
 
@@ -255,7 +292,7 @@ If you scraped multiple cities at once, there will be one file with all results 
 
 ---
 
-## 8. Configuring cities and settings
+## 10. Configuring cities and settings
 
 All settings live in the file `config/targets.yaml`. You can open it with any text editor (Notepad on Windows, TextEdit on Mac, or any code editor).
 
@@ -291,7 +328,7 @@ scraper:
 
 ---
 
-## 9. Troubleshooting
+## 11. Troubleshooting
 
 ### "python: command not found" or "python3: command not found"
 
@@ -327,7 +364,7 @@ Try opening your Command Prompt as Administrator: right-click the Command Prompt
 
 ---
 
-## 10. Limitations and known constraints
+## 12. Limitations and known constraints
 
 | Limitation | Details |
 |---|---|
