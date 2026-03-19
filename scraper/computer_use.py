@@ -108,20 +108,32 @@ def _city_slug(city: str) -> str:
     return city.strip().lower().replace(" ", "-")
 
 
-def _build_task_prompt(city: str, max_locations: int, city_url: str) -> str:
+def _build_task_prompt(city: str, max_locations: int, landed_on_city_page: bool, city_url: str) -> str:
     limit_clause = (
         f"Collect up to {max_locations} locations."
         if max_locations > 0
         else "Collect all available locations on the page."
     )
-    return f"""The browser is already open and has been navigated to the Bounce luggage storage page for {city}:
+
+    if landed_on_city_page:
+        starting_context = f"""The browser is already open and has been navigated to the Bounce luggage storage page for {city}:
   {city_url}
 
-Take a screenshot first to see what is currently on screen.
+Take a screenshot first to see what is currently on screen."""
+        step1 = "If you see a cookie consent banner, dismiss it by clicking the accept/close button."
+    else:
+        starting_context = f"""The browser is already open on the Bounce homepage (https://www.usebounce.com).
+The direct city URL returned an error, so you must search for the city manually.
+
+Take a screenshot first to see what is currently on screen."""
+        step1 = f"""Dismiss any cookie consent banner if present.
+   Then find the search box on the page and type "{city}", select the first suggestion, and wait for the location list to load."""
+
+    return f"""{starting_context}
 
 Your task — extract pricing from each storage location card on this page:
 
-1. If you see a cookie consent banner, dismiss it by clicking the accept/close button.
+1. {step1}
 2. You should see a list of storage location cards on the left side of the page.
    - Each card shows a location name and address.
 3. For each card:
@@ -316,6 +328,7 @@ async def _run_agent_loop(
     city: str,
     max_locations: int,
     city_url: str,
+    landed_on_city_page: bool = True,
 ) -> list[PriceRecord]:
     """
     Run the Computer Use agent loop for one city.
@@ -324,7 +337,7 @@ async def _run_agent_loop(
     MAX_ITERATIONS is reached, or an unrecoverable API error occurs.
     """
     messages: list[dict] = [
-        {"role": "user", "content": _build_task_prompt(city, max_locations, city_url)}
+        {"role": "user", "content": _build_task_prompt(city, max_locations, landed_on_city_page, city_url)}
     ]
     # Accumulates records reported mid-session (e.g. per-location tool calls in future)
     partial_records: list[PriceRecord] = []
@@ -489,22 +502,38 @@ async def scrape_city_computer_use(
 
     client = anthropic.Anthropic(api_key=api_key)
 
-    # Navigate directly to the city page before starting the agent —
-    # this skips the search-bar flow and saves ~10 iterations.
+    # Try navigating directly to the city page — faster, but may return 4xx/5xx.
+    # Fall back to the homepage so Claude can search manually.
     city_url = f"https://www.usebounce.com/luggage-storage/{_city_slug(city)}"
+    homepage_url = "https://www.usebounce.com"
+    landed_on_city_page = False
+
     print(f"[{city}] Pre-navigating to {city_url}")
     try:
-        await page.goto(city_url, wait_until="domcontentloaded", timeout=30_000)
-        # Wait for location cards to render (JS SPA may need a moment)
-        try:
-            await page.wait_for_selector(
-                "a[href*='/luggage-storage/'], [class*='location'], [class*='Location']",
-                timeout=8_000,
-            )
-        except Exception:
-            await asyncio.sleep(4)  # fallback if selector never appears
+        resp = await page.goto(city_url, wait_until="domcontentloaded", timeout=30_000)
+        if resp and resp.status < 400:
+            landed_on_city_page = True
+            # Wait for location cards to appear (JS SPA may need a moment)
+            try:
+                await page.wait_for_selector(
+                    "[class*='location'], [class*='Location'], [class*='store'], [class*='venue']",
+                    timeout=8_000,
+                )
+            except Exception:
+                await asyncio.sleep(4)
+            print(f"[{city}] City page loaded (HTTP {resp.status})")
+        else:
+            status = resp.status if resp else "unknown"
+            print(f"[{city}] City URL returned HTTP {status} — falling back to homepage search")
+            await page.goto(homepage_url, wait_until="domcontentloaded", timeout=30_000)
+            await asyncio.sleep(3)
     except Exception as nav_exc:
-        print(f"[{city}] Pre-navigation failed ({nav_exc}) — agent will navigate manually")
+        print(f"[{city}] Navigation failed ({nav_exc}) — falling back to homepage")
+        try:
+            await page.goto(homepage_url, wait_until="domcontentloaded", timeout=30_000)
+            await asyncio.sleep(3)
+        except Exception:
+            pass
 
     # Save a debug screenshot so you can inspect what the browser loaded
     try:
@@ -518,7 +547,9 @@ async def scrape_city_computer_use(
 
     print(f"[{city}] Using Computer Use API (model: {MODEL})")
     try:
-        records = await _run_agent_loop(client, page, city, max_locations, city_url)
+        records = await _run_agent_loop(
+            client, page, city, max_locations, city_url, landed_on_city_page
+        )
     except Exception as exc:
         print(f"  [CU] Agent loop failed for {city}: {exc}")
         return []
