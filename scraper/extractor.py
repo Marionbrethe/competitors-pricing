@@ -10,7 +10,6 @@ Strategy:
 The scraper collects: city, location_name, address, size, price, currency, price_unit.
 """
 import asyncio
-import json
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -21,6 +20,7 @@ from scraper.models import PriceRecord
 
 
 BASE_URL = "https://www.usebounce.com"
+CITY_PAGE_TEMPLATE = BASE_URL + "/luggage-storage/{slug}"
 
 # Currency symbol → ISO code mapping
 CURRENCY_MAP = {
@@ -157,55 +157,89 @@ def _parse_price_text(text: str) -> tuple[float, str, str]:
     return amount, currency, unit.lower()
 
 
-async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -> list[PriceRecord]:
-    """Full DOM scraping fallback for one city."""
-    records: list[PriceRecord] = []
-    scraped_at = datetime.now(timezone.utc)
+def _city_to_slug(city: str) -> str:
+    """Convert 'New York' → 'new-york' for URL paths."""
+    return city.strip().lower().replace(" ", "-")
 
-    # 1. Navigate to Bounce and search for the city
+
+async def _navigate_to_city(page: Page, city: str, delay: float) -> bool:
+    """
+    Try direct URL navigation to the city page.
+    Returns True if the page loaded and contains location results.
+    """
+    slug = _city_to_slug(city)
+    url = CITY_PAGE_TEMPLATE.format(slug=slug)
+    print(f"  Trying direct URL: {url}")
+    try:
+        resp = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        if resp and resp.status >= 400:
+            print(f"  Direct URL returned HTTP {resp.status} — will try search")
+            return False
+        await asyncio.sleep(delay)
+        return True
+    except Exception as e:
+        print(f"  Direct URL failed: {e}")
+        return False
+
+
+async def _search_for_city(page: Page, city: str, delay: float) -> bool:
+    """
+    Navigate to the homepage and use the search box to find the city.
+    Returns True if a search was successfully submitted.
+    """
     await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30_000)
     await asyncio.sleep(2)
 
-    # Try to find and fill the search input
     search_selectors = [
         'input[placeholder*="city" i]',
         'input[placeholder*="location" i]',
         'input[placeholder*="where" i]',
+        'input[placeholder*="search" i]',
+        'input[placeholder*="store" i]',
+        'input[placeholder*="address" i]',
+        'input[placeholder*="destination" i]',
         'input[type="search"]',
         'input[name="search"]',
         'input[name="location"]',
+        'input[name="q"]',
+        '[data-testid*="search"] input',
+        '[class*="search"] input',
+        '[class*="Search"] input',
+        'form input[type="text"]',
     ]
     search_input = None
     for sel in search_selectors:
         try:
             el = page.locator(sel).first
-            if await el.is_visible(timeout=2_000):
+            if await el.is_visible(timeout=1_500):
                 search_input = el
+                print(f"  Found search input via: {sel}")
                 break
         except Exception:
             continue
 
     if search_input is None:
         print(f"  [!] Could not find search input on {BASE_URL} for city '{city}'")
-        return records
+        return False
 
     await search_input.click()
     await search_input.fill(city)
     await asyncio.sleep(1)
 
-    # Wait for autocomplete suggestions and click the first one
     suggestion_selectors = [
         '[role="option"]',
         '[class*="suggestion"]',
         '[class*="autocomplete"] li',
         '[class*="dropdown"] li',
         '[data-testid*="suggestion"]',
+        'ul[class*="search"] li',
+        'ul[class*="result"] li',
     ]
     suggestion_clicked = False
     for sel in suggestion_selectors:
         try:
             el = page.locator(sel).first
-            if await el.is_visible(timeout=3_000):
+            if await el.is_visible(timeout=2_000):
                 await el.click()
                 suggestion_clicked = True
                 break
@@ -213,19 +247,44 @@ async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -
             continue
 
     if not suggestion_clicked:
-        # Try pressing Enter as fallback
         await search_input.press("Enter")
 
     await asyncio.sleep(delay)
+    return True
+
+
+async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -> list[PriceRecord]:
+    """Full DOM scraping fallback for one city."""
+    records: list[PriceRecord] = []
+    scraped_at = datetime.now(timezone.utc)
+
+    # 1. Try direct city URL first, fall back to search
+    navigated = await _navigate_to_city(page, city, delay)
+    if not navigated:
+        ok = await _search_for_city(page, city, delay)
+        if not ok:
+            return records
 
     # 2. Collect location cards from the results list
     location_selectors = [
         '[data-testid*="location"]',
+        '[data-testid*="store"]',
+        '[data-testid*="venue"]',
         '[class*="location-card"]',
+        '[class*="LocationCard"]',
         '[class*="store-card"]',
+        '[class*="StoreCard"]',
         '[class*="venue-card"]',
+        '[class*="VenueCard"]',
         '[class*="result-item"]',
+        '[class*="ResultItem"]',
+        '[class*="storage-location"]',
+        '[class*="StorageLocation"]',
         'li[class*="listing"]',
+        'li[class*="Listing"]',
+        'article[class*="location"]',
+        'article[class*="store"]',
+        'a[href*="/luggage-storage/"]',
     ]
     location_elements = []
     for sel in location_selectors:
@@ -400,40 +459,19 @@ async def scrape_city(
     collector = _ApiCollector()
     page.on("response", lambda r: asyncio.ensure_future(collector.handle_response(r)))
 
-    print(f"[{city}] Navigating to {BASE_URL} …")
+    slug = _city_to_slug(city)
+    city_url = CITY_PAGE_TEMPLATE.format(slug=slug)
+    print(f"[{city}] Navigating to {city_url} …")
 
-    # Navigate and trigger the search
-    await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30_000)
-    await asyncio.sleep(2)
-
-    # Attempt to search for the city (same logic used in DOM fallback)
-    search_selectors = [
-        'input[placeholder*="city" i]',
-        'input[placeholder*="location" i]',
-        'input[placeholder*="where" i]',
-        'input[type="search"]',
-        'input[name="search"]',
-        'input[name="location"]',
-    ]
-    for sel in search_selectors:
-        try:
-            el = page.locator(sel).first
-            if await el.is_visible(timeout=2_000):
-                await el.click()
-                await el.fill(city)
-                await asyncio.sleep(1)
-                # Click first autocomplete suggestion
-                for sug_sel in ['[role="option"]', '[class*="suggestion"]', '[class*="autocomplete"] li']:
-                    try:
-                        sug = page.locator(sug_sel).first
-                        if await sug.is_visible(timeout=2_000):
-                            await sug.click()
-                            break
-                    except Exception:
-                        continue
-                break
-        except Exception:
-            continue
+    # Try direct city URL first; fall back to homepage search
+    try:
+        resp = await page.goto(city_url, wait_until="domcontentloaded", timeout=30_000)
+        if resp and resp.status >= 400:
+            print(f"[{city}] Direct URL returned HTTP {resp.status} — trying homepage search")
+            await _search_for_city(page, city, delay)
+    except Exception as e:
+        print(f"[{city}] Direct URL failed ({e}) — trying homepage search")
+        await _search_for_city(page, city, delay)
 
     await asyncio.sleep(delay)
 
