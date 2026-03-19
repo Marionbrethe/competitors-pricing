@@ -31,12 +31,22 @@ TOOL_VERSION = "computer_20251124"
 BETA_HEADER = "computer-use-2025-11-24"
 VIEWPORT_WIDTH = 1280
 VIEWPORT_HEIGHT = 800
-MAX_ITERATIONS = 25
+MAX_ITERATIONS = 50
 REPORT_TOOL_NAME = "report_pricing_data"
 # Keep this many recent user turns with full screenshots; older turns get images stripped
 SCREENSHOT_HISTORY_TURNS = 3
 # Retry delays (seconds) on 429 rate-limit errors
 RATE_LIMIT_RETRY_DELAYS = [60, 120, 240]
+
+# System prompt establishes Claude's role and tells it about auto-screenshots
+SYSTEM_PROMPT = (
+    "You are a precise web scraping agent operating a real browser. "
+    "Your only goal is to extract luggage storage pricing data from the page shown. "
+    "Important: after every click/scroll/type action you will automatically receive a screenshot "
+    "showing the updated page — you do NOT need to request an extra screenshot after each action. "
+    "Be efficient: process one location at a time, record its prices, go back, repeat. "
+    "Call report_pricing_data as soon as you have collected all requested records."
+)
 
 # ---------------------------------------------------------------------------
 # Tool definitions
@@ -143,7 +153,9 @@ async def _execute_computer_action(
 ) -> bytes | None:
     """
     Execute a single computer tool action via Playwright.
-    Returns screenshot bytes if action == 'screenshot', else None.
+    Returns screenshot bytes always — either directly for 'screenshot' actions,
+    or automatically captured after every other action so Claude always sees the
+    current page state without spending an extra iteration on a screenshot request.
     """
     if action == "screenshot":
         return await page.screenshot(type="png", full_page=False)
@@ -191,8 +203,12 @@ async def _execute_computer_action(
 
     else:
         print(f"  [CU] Unhandled action: {action!r}")
+        return None
 
-    return None
+    # Auto-screenshot after every non-screenshot action so Claude always sees
+    # the current page state without spending an extra iteration requesting it.
+    await asyncio.sleep(0.5)  # brief pause to let JS/animations settle
+    return await page.screenshot(type="png", full_page=False)
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +335,23 @@ async def _run_agent_loop(
         # Trim old screenshots before each API call to keep token count low
         trimmed_messages = _trim_old_screenshots(messages)
 
+        # When close to the iteration limit, inject an urgency reminder so Claude
+        # wraps up and calls report_pricing_data rather than continuing to browse.
+        WARN_AT = 5
+        if iteration == MAX_ITERATIONS - WARN_AT and len(trimmed_messages) > 1:
+            last = trimmed_messages[-1]
+            if last.get("role") == "user":
+                content = last.get("content", [])
+                if isinstance(content, list):
+                    content = content + [{
+                        "type": "text",
+                        "text": (
+                            f"⚠️ Only {WARN_AT} iterations remaining. "
+                            "Stop browsing and call report_pricing_data now with whatever data you have collected so far."
+                        ),
+                    }]
+                    trimmed_messages = trimmed_messages[:-1] + [{**last, "content": content}]
+
         # Call API with retry on rate-limit (429)
         response = None
         for attempt, delay in enumerate([0] + RATE_LIMIT_RETRY_DELAYS):
@@ -329,6 +362,7 @@ async def _run_agent_loop(
                 response = client.beta.messages.create(
                     model=MODEL,
                     max_tokens=4096,
+                    system=SYSTEM_PROMPT,
                     tools=[COMPUTER_TOOL, REPORT_TOOL],
                     messages=trimmed_messages,
                     betas=[BETA_HEADER],
@@ -377,7 +411,6 @@ async def _run_agent_loop(
                 records = _parse_report_tool_call(tool_input, city)
                 # Merge with anything accumulated in partial_records
                 all_records = partial_records + records
-                to_csv(all_records, output_dir="output", city=city)
                 return all_records
 
             # Computer actions
@@ -462,7 +495,14 @@ async def scrape_city_computer_use(
     print(f"[{city}] Pre-navigating to {city_url}")
     try:
         await page.goto(city_url, wait_until="domcontentloaded", timeout=30_000)
-        await asyncio.sleep(3)  # let JS render the location cards
+        # Wait for location cards to render (JS SPA may need a moment)
+        try:
+            await page.wait_for_selector(
+                "a[href*='/luggage-storage/'], [class*='location'], [class*='Location']",
+                timeout=8_000,
+            )
+        except Exception:
+            await asyncio.sleep(4)  # fallback if selector never appears
     except Exception as nav_exc:
         print(f"[{city}] Pre-navigation failed ({nav_exc}) — agent will navigate manually")
 
