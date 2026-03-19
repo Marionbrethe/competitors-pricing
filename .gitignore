@@ -1,0 +1,9 @@
+output/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+*.csv
+*.json

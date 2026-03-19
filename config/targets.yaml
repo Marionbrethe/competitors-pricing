@@ -1,0 +1,25 @@
+competitor:
+  name: Bounce
+  url: https://www.usebounce.com
+
+cities:
+  - London
+  - Paris
+  - New York
+  - Barcelona
+  - Amsterdam
+  - Rome
+  - Berlin
+  - Madrid
+  - Lisbon
+  - Tokyo
+
+scraper:
+  # Seconds to wait between clicking each location (be polite)
+  delay_between_locations: 2
+  # Seconds to wait after searching a city
+  delay_after_search: 3
+  # Max locations to scrape per city (set to 0 for unlimited)
+  max_locations_per_city: 0
+  # Run browser in headless mode (true = no visible window)
+  headless: true
