@@ -510,21 +510,20 @@ async def scrape_city_computer_use(
 
     print(f"[{city}] Pre-navigating to {city_url}")
     try:
-        resp = await page.goto(city_url, wait_until="domcontentloaded", timeout=30_000)
-        if resp and resp.status < 400:
+        await page.goto(city_url, wait_until="domcontentloaded", timeout=30_000)
+        await asyncio.sleep(2)
+
+        # Detect error pages — Bounce returns HTTP 200 even for 500 error pages,
+        # so we must inspect the page content instead of relying on the status code.
+        page_text = (await page.inner_text("body")).lower()
+        error_indicators = ["internal server error", "something went wrong", "page not found", "404", "error"]
+        is_error_page = any(ind in page_text for ind in error_indicators)
+
+        if not is_error_page:
             landed_on_city_page = True
-            # Wait for location cards to appear (JS SPA may need a moment)
-            try:
-                await page.wait_for_selector(
-                    "[class*='location'], [class*='Location'], [class*='store'], [class*='venue']",
-                    timeout=8_000,
-                )
-            except Exception:
-                await asyncio.sleep(4)
-            print(f"[{city}] City page loaded (HTTP {resp.status})")
+            print(f"[{city}] City page loaded successfully")
         else:
-            status = resp.status if resp else "unknown"
-            print(f"[{city}] City URL returned HTTP {status} — falling back to homepage search")
+            print(f"[{city}] City page shows an error — falling back to homepage search")
             await page.goto(homepage_url, wait_until="domcontentloaded", timeout=30_000)
             await asyncio.sleep(3)
     except Exception as nav_exc:
