@@ -12,6 +12,7 @@ Usage:
 """
 import base64
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,6 +20,7 @@ import anthropic
 from playwright.async_api import Page
 
 from scraper.models import PriceRecord
+from scraper.export import to_csv
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -30,6 +32,10 @@ VIEWPORT_WIDTH = 1280
 VIEWPORT_HEIGHT = 800
 MAX_ITERATIONS = 50
 REPORT_TOOL_NAME = "report_pricing_data"
+# Keep this many recent user turns with full screenshots; older turns get images stripped
+SCREENSHOT_HISTORY_TURNS = 3
+# Retry delays (seconds) on 429 rate-limit errors
+RATE_LIMIT_RETRY_DELAYS = [60, 120, 240]
 
 # ---------------------------------------------------------------------------
 # Tool definitions
@@ -221,6 +227,63 @@ def _parse_report_tool_call(
 
 
 # ---------------------------------------------------------------------------
+# Conversation history helpers
+# ---------------------------------------------------------------------------
+
+def _trim_old_screenshots(messages: list[dict]) -> list[dict]:
+    """
+    Replace base64 image data in older tool_result messages with a text
+    placeholder to keep input token count under control.
+
+    The most recent SCREENSHOT_HISTORY_TURNS user turns (index > 0) keep their
+    images; everything older is stripped.
+    """
+    # Indices of user messages after the initial task prompt (index 0)
+    user_indices = [i for i, m in enumerate(messages) if m.get("role") == "user" and i > 0]
+    if len(user_indices) <= SCREENSHOT_HISTORY_TURNS:
+        return messages  # Nothing to trim yet
+
+    trim_set = set(user_indices[:-SCREENSHOT_HISTORY_TURNS])
+
+    result = []
+    for i, msg in enumerate(messages):
+        if i not in trim_set:
+            result.append(msg)
+            continue
+
+        content = msg.get("content", [])
+        if not isinstance(content, list):
+            result.append(msg)
+            continue
+
+        new_content = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "tool_result":
+                inner = item.get("content", [])
+                new_inner = [
+                    {"type": "text", "text": "[screenshot removed to reduce token usage]"}
+                    if isinstance(c, dict) and c.get("type") == "image"
+                    else c
+                    for c in inner
+                ]
+                new_content.append({**item, "content": new_inner})
+            else:
+                new_content.append(item)
+
+        result.append({**msg, "content": new_content})
+
+    return result
+
+
+def _save_partial(records: list[PriceRecord], city: str) -> None:
+    """Write whatever records we have so far to a partial CSV."""
+    if not records:
+        return
+    path = to_csv(records, output_dir="output", city=f"{city}_partial")
+    print(f"  [CU] Partial save: {len(records)} record(s) → {path}")
+
+
+# ---------------------------------------------------------------------------
 # Agent loop
 # ---------------------------------------------------------------------------
 
@@ -239,35 +302,56 @@ async def _run_agent_loop(
     messages: list[dict] = [
         {"role": "user", "content": _build_task_prompt(city, max_locations)}
     ]
+    # Accumulates records reported mid-session (e.g. per-location tool calls in future)
+    partial_records: list[PriceRecord] = []
 
     for iteration in range(1, MAX_ITERATIONS + 1):
         print(f"  [CU] Iteration {iteration}/{MAX_ITERATIONS}")
 
-        try:
-            response = client.beta.messages.create(
-                model=MODEL,
-                max_tokens=4096,
-                tools=[COMPUTER_TOOL, REPORT_TOOL],
-                messages=messages,
-                betas=[BETA_HEADER],
-            )
-        except anthropic.APIStatusError as exc:
-            print(f"  [CU] API error (HTTP {exc.status_code}): {exc.message}")
-            raise
-        except anthropic.APIConnectionError as exc:
-            print(f"  [CU] Connection error: {exc}")
-            raise
+        # Trim old screenshots before each API call to keep token count low
+        trimmed_messages = _trim_old_screenshots(messages)
 
-        # Append Claude's response to conversation history
+        # Call API with retry on rate-limit (429)
+        response = None
+        for attempt, delay in enumerate([0] + RATE_LIMIT_RETRY_DELAYS):
+            if delay:
+                print(f"  [CU] Rate limited — waiting {delay}s before retry {attempt}/{len(RATE_LIMIT_RETRY_DELAYS)}...")
+                time.sleep(delay)
+            try:
+                response = client.beta.messages.create(
+                    model=MODEL,
+                    max_tokens=4096,
+                    tools=[COMPUTER_TOOL, REPORT_TOOL],
+                    messages=trimmed_messages,
+                    betas=[BETA_HEADER],
+                )
+                break  # success
+            except anthropic.RateLimitError as exc:
+                print(f"  [CU] Rate limit error (attempt {attempt + 1}): {exc.message}")
+                if attempt == len(RATE_LIMIT_RETRY_DELAYS):
+                    _save_partial(partial_records, city)
+                    raise
+            except anthropic.APIStatusError as exc:
+                print(f"  [CU] API error (HTTP {exc.status_code}): {exc.message}")
+                _save_partial(partial_records, city)
+                raise
+            except anthropic.APIConnectionError as exc:
+                print(f"  [CU] Connection error: {exc}")
+                _save_partial(partial_records, city)
+                raise
+
+        # Append Claude's response to the FULL (untrimmed) history
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason == "end_turn":
             print(f"  [CU] Claude ended turn without calling {REPORT_TOOL_NAME}. Returning empty.")
-            return []
+            _save_partial(partial_records, city)
+            return partial_records
 
         if response.stop_reason != "tool_use":
             print(f"  [CU] Unexpected stop_reason: {response.stop_reason!r}. Returning empty.")
-            return []
+            _save_partial(partial_records, city)
+            return partial_records
 
         # Process tool use blocks
         tool_results: list[dict] = []
@@ -282,7 +366,11 @@ async def _run_agent_loop(
             # Termination: Claude has collected all data
             if tool_name == REPORT_TOOL_NAME:
                 print(f"  [CU] Claude called {REPORT_TOOL_NAME} — parsing results.")
-                return _parse_report_tool_call(tool_input, city)
+                records = _parse_report_tool_call(tool_input, city)
+                # Merge with anything accumulated in partial_records
+                all_records = partial_records + records
+                to_csv(all_records, output_dir="output", city=city)
+                return all_records
 
             # Computer actions
             if tool_name == "computer":
@@ -331,8 +419,9 @@ async def _run_agent_loop(
         if tool_results:
             messages.append({"role": "user", "content": tool_results})
 
-    print(f"  [CU] Reached MAX_ITERATIONS ({MAX_ITERATIONS}) without completion. Returning empty.")
-    return []
+    print(f"  [CU] Reached MAX_ITERATIONS ({MAX_ITERATIONS}) without completion.")
+    _save_partial(partial_records, city)
+    return partial_records
 
 
 # ---------------------------------------------------------------------------
