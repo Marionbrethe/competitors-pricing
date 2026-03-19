@@ -407,7 +407,7 @@ async def _run_agent_loop(
 
             # Termination: Claude has collected all data
             if tool_name == REPORT_TOOL_NAME:
-                print(f"  [CU] Claude called {REPORT_TOOL_NAME} — parsing results.")
+                print(f"  [CU] Claude called {REPORT_TOOL_NAME} — raw input: {tool_input}")
                 records = _parse_report_tool_call(tool_input, city)
                 # Merge with anything accumulated in partial_records
                 all_records = partial_records + records
@@ -505,6 +505,16 @@ async def scrape_city_computer_use(
             await asyncio.sleep(4)  # fallback if selector never appears
     except Exception as nav_exc:
         print(f"[{city}] Pre-navigation failed ({nav_exc}) — agent will navigate manually")
+
+    # Save a debug screenshot so you can inspect what the browser loaded
+    try:
+        import pathlib
+        pathlib.Path("output").mkdir(exist_ok=True)
+        debug_path = f"output/debug_{_city_slug(city)}_pageload.png"
+        await page.screenshot(path=debug_path, full_page=False)
+        print(f"[{city}] Debug screenshot saved → {debug_path}")
+    except Exception as ss_exc:
+        print(f"[{city}] Could not save debug screenshot: {ss_exc}")
 
     print(f"[{city}] Using Computer Use API (model: {MODEL})")
     try:
