@@ -365,11 +365,11 @@ async def _run_agent_loop(
                     }]
                     trimmed_messages = trimmed_messages[:-1] + [{**last, "content": content}]
 
-        # Call API with retry on rate-limit (429)
+        # Call API with retry on rate-limit (429) and overloaded (529)
         response = None
         for attempt, delay in enumerate([0] + RATE_LIMIT_RETRY_DELAYS):
             if delay:
-                print(f"  [CU] Rate limited — waiting {delay}s before retry {attempt}/{len(RATE_LIMIT_RETRY_DELAYS)}...")
+                print(f"  [CU] API busy — waiting {delay}s before retry {attempt}/{len(RATE_LIMIT_RETRY_DELAYS)}...")
                 time.sleep(delay)
             try:
                 response = client.beta.messages.create(
@@ -382,14 +382,20 @@ async def _run_agent_loop(
                 )
                 break  # success
             except anthropic.RateLimitError as exc:
-                print(f"  [CU] Rate limit error (attempt {attempt + 1}): {exc.message}")
+                print(f"  [CU] Rate limit (429) attempt {attempt + 1}: {exc.message}")
                 if attempt == len(RATE_LIMIT_RETRY_DELAYS):
                     _save_partial(partial_records, city)
                     raise
             except anthropic.APIStatusError as exc:
-                print(f"  [CU] API error (HTTP {exc.status_code}): {exc.message}")
-                _save_partial(partial_records, city)
-                raise
+                if exc.status_code == 529:
+                    print(f"  [CU] API overloaded (529) attempt {attempt + 1} — will retry")
+                    if attempt == len(RATE_LIMIT_RETRY_DELAYS):
+                        _save_partial(partial_records, city)
+                        raise
+                else:
+                    print(f"  [CU] API error (HTTP {exc.status_code}): {exc.message}")
+                    _save_partial(partial_records, city)
+                    raise
             except anthropic.APIConnectionError as exc:
                 print(f"  [CU] Connection error: {exc}")
                 _save_partial(partial_records, city)
