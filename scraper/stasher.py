@@ -34,7 +34,8 @@ CURRENCY_MAP = {
 }
 
 _PRICE_RE = re.compile(
-    r"([£$€¥]|A\$|C\$)\s*([\d,]+(?:\.\d+)?)\s*/?\s*(?:bag\s*/\s*)?(\w+)",
+    r"([£$€¥]|A\$|C\$)\s*([\d,]+(?:\.\d+)?)"
+    r"\s*(?:/|per|a)?\s*(?:bag\s*(?:/|per)\s*)?(\w+)",
     re.IGNORECASE,
 )
 
@@ -116,20 +117,17 @@ class _ApiCollector:
         self.locations: list[dict[str, Any]] = []
 
     async def handle_response(self, response: Response) -> None:
-        url = response.url
-        if not any(kw in url for kw in ("stash", "location", "search", "storage", "venue", "spot", "availab")):
-            return
         if response.status != 200:
             return
         if "json" not in response.headers.get("content-type", ""):
             return
         try:
             body = await response.json()
-            if isinstance(body, list) and body:
+            if isinstance(body, list) and body and isinstance(body[0], dict):
                 self.locations.extend(body)
             elif isinstance(body, dict):
                 for key in ("data", "results", "locations", "stashpoints", "items", "venues", "spots"):
-                    if key in body and isinstance(body[key], list):
+                    if key in body and isinstance(body[key], list) and body[key]:
                         self.locations.extend(body[key])
                         break
         except Exception:
@@ -289,8 +287,10 @@ async def _body_text_scan(page: Page, city: str, scraped_at: datetime) -> list[P
         all_text = await page.inner_text("body")
     except Exception:
         return records
+    snippet = all_text.replace("\n", " ").strip()
+    print(f"  [Stasher] Page snippet: {snippet[:500]}")
     price_re = re.compile(
-        r"([£$€])\s*([\d.]+)\s*/?\s*(?:bag\s*/\s*)?day",
+        r"([£$€])\s*([\d.]+)\s*(?:/|per|a)?\s*(?:bag\s*(?:/|per)\s*)?day",
         re.IGNORECASE,
     )
     seen: set[float] = set()
