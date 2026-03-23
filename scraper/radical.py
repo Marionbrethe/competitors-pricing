@@ -144,13 +144,20 @@ def _parse_price_text(text: str) -> tuple[float, str, str]:
 
 async def _try_navigate(page: Page, url: str, delay: float) -> bool:
     try:
-        resp = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        resp = await page.goto(url, wait_until="networkidle", timeout=45_000)
         if resp and resp.status >= 400:
             return False
         await asyncio.sleep(delay)
         return True
     except Exception:
-        return False
+        try:
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            if resp and resp.status >= 400:
+                return False
+            await asyncio.sleep(delay + 2)
+            return True
+        except Exception:
+            return False
 
 
 async def _search_for_city(page: Page, city: str, delay: float) -> bool:
@@ -293,8 +300,16 @@ async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -
                 except Exception:
                     continue
 
+            # Try card text first; if empty try parent element (anchors don't contain price text)
             card_text = await loc_el.inner_text(timeout=2_000)
             price, currency, unit = _parse_price_text(card_text)
+
+            if price <= 0:
+                try:
+                    parent_text = await loc_el.locator("xpath=..").inner_text(timeout=1_000)
+                    price, currency, unit = _parse_price_text(parent_text)
+                except Exception:
+                    pass
 
             if price > 0:
                 records.append(PriceRecord(
@@ -315,6 +330,37 @@ async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -
         except Exception as e:
             print(f"  [Radical] Error on location #{i+1}: {e}")
             continue
+
+    # If card iteration found nothing, scan the full page body for prices
+    if not records:
+        print(f"  [Radical] No prices in cards — scanning full page body …")
+        all_text = await page.inner_text("body")
+        price_re = re.compile(
+            r"([£$€])\s*([\d.]+)\s*/\s*(?:bag\s*/\s*)?day",
+            re.IGNORECASE,
+        )
+        seen: set[float] = set()
+        for m in price_re.finditer(all_text):
+            symbol, amount_str = m.group(1), m.group(2)
+            price = float(amount_str)
+            if price >= 2.0 and price not in seen:
+                seen.add(price)
+                currency = CURRENCY_MAP.get(symbol, "EUR")
+                records.append(PriceRecord(
+                    company="Radical Storage",
+                    city=city,
+                    location_name="Radical Storage location",
+                    address="",
+                    size="flat-rate",
+                    price=price,
+                    currency=currency,
+                    price_unit="day",
+                    scraped_at=scraped_at,
+                ))
+        if records:
+            print(f"  [Radical] Body scan found {len(records)} distinct price(s)")
+        else:
+            print(f"  [Radical] No prices found anywhere on the page")
 
     return records
 

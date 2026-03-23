@@ -21,6 +21,7 @@ from scraper.models import PriceRecord
 
 BASE_URL = "https://stasher.com"
 CITY_PAGE_TEMPLATE = BASE_URL + "/luggage-storage/{country}/{slug}"
+CITY_PAGE_SIMPLE = BASE_URL + "/luggage-storage/{slug}"
 
 # Currency symbol → ISO code mapping
 CURRENCY_MAP = {
@@ -196,18 +197,28 @@ def _parse_price_text(text: str) -> tuple[float, str, str]:
 async def _navigate_to_city(page: Page, city: str, delay: float) -> bool:
     slug = _city_to_slug(city)
     country = _get_country(city)
-    url = CITY_PAGE_TEMPLATE.format(country=country, slug=slug)
-    print(f"  [Stasher] Trying direct URL: {url}")
-    try:
-        resp = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        if resp and resp.status >= 400:
-            print(f"  [Stasher] Direct URL returned HTTP {resp.status} — will try search")
-            return False
-        await asyncio.sleep(delay)
-        return True
-    except Exception as e:
-        print(f"  [Stasher] Direct URL failed: {e}")
-        return False
+
+    # Try simple URL first (no country prefix), then country-prefixed URL
+    for url in [
+        CITY_PAGE_SIMPLE.format(slug=slug),
+        CITY_PAGE_TEMPLATE.format(country=country, slug=slug),
+    ]:
+        print(f"  [Stasher] Trying direct URL: {url}")
+        try:
+            resp = await page.goto(url, wait_until="networkidle", timeout=45_000)
+            if resp and resp.status < 400:
+                await asyncio.sleep(delay)
+                return True
+            print(f"  [Stasher] {url} returned HTTP {resp.status if resp else '?'} — trying next")
+        except Exception:
+            try:
+                resp = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                if resp and resp.status < 400:
+                    await asyncio.sleep(delay + 3)  # extra wait for JS render
+                    return True
+            except Exception as e:
+                print(f"  [Stasher] {url} failed: {e}")
+    return False
 
 
 async def _search_for_city(page: Page, city: str, delay: float) -> bool:
@@ -271,6 +282,42 @@ async def _search_for_city(page: Page, city: str, delay: float) -> bool:
     return True
 
 
+async def _body_text_scan(page: Page, city: str, scraped_at: datetime) -> list[PriceRecord]:
+    """Scan full page body for price patterns — last resort."""
+    records: list[PriceRecord] = []
+    try:
+        all_text = await page.inner_text("body")
+    except Exception:
+        return records
+    price_re = re.compile(
+        r"([£$€])\s*([\d.]+)\s*/?\s*(?:bag\s*/\s*)?day",
+        re.IGNORECASE,
+    )
+    seen: set[float] = set()
+    for m in price_re.finditer(all_text):
+        symbol, amount_str = m.group(1), m.group(2)
+        price = float(amount_str)
+        if price > 0 and price not in seen:
+            seen.add(price)
+            currency = CURRENCY_MAP.get(symbol, "GBP")
+            records.append(PriceRecord(
+                company="Stasher",
+                city=city,
+                location_name="Stasher location",
+                address="",
+                size="flat-rate",
+                price=price,
+                currency=currency,
+                price_unit="day",
+                scraped_at=scraped_at,
+            ))
+    if records:
+        print(f"  [Stasher] Body scan found {len(records)} distinct price(s)")
+    else:
+        print(f"  [Stasher] No prices found anywhere on the page")
+    return records
+
+
 async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -> list[PriceRecord]:
     records: list[PriceRecord] = []
     scraped_at = datetime.now(timezone.utc)
@@ -284,16 +331,27 @@ async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -
     location_selectors = [
         '[data-testid*="stashpoint"]',
         '[data-testid*="location"]',
+        '[data-testid*="venue"]',
         '[class*="stashpoint"]',
         '[class*="StashPoint"]',
         '[class*="location-card"]',
         '[class*="LocationCard"]',
         '[class*="store-card"]',
+        '[class*="StoreCard"]',
+        '[class*="venue-card"]',
+        '[class*="VenueCard"]',
         '[class*="result-item"]',
+        '[class*="ResultItem"]',
         '[class*="storage-location"]',
+        '[class*="listing-item"]',
+        '[class*="ListingItem"]',
         'li[class*="listing"]',
+        'li[class*="location"]',
         'article[class*="location"]',
+        'article[class*="store"]',
         'a[href*="/luggage-storage/"]',
+        'a[href*="/stash/"]',
+        'a[href*="/stashpoint"]',
     ]
     location_elements = []
     for sel in location_selectors:
@@ -305,33 +363,8 @@ async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -
             break
 
     if not location_elements:
-        # Last resort: scan page text for price patterns
-        all_text = await page.inner_text("body")
-        price_re = re.compile(
-            r"([£$€])\s*([\d.]+)\s*/?\s*(?:bag\s*/\s*)?day",
-            re.IGNORECASE,
-        )
-        seen: set[float] = set()
-        for m in price_re.finditer(all_text):
-            symbol, amount_str = m.group(1), m.group(2)
-            price = float(amount_str)
-            if price > 0 and price not in seen:
-                seen.add(price)
-                currency = CURRENCY_MAP.get(symbol, "GBP")
-                records.append(PriceRecord(
-                    company="Stasher",
-                    city=city,
-                    location_name="Stasher location",
-                    address="",
-                    size="flat-rate",
-                    price=price,
-                    currency=currency,
-                    price_unit="day",
-                    scraped_at=scraped_at,
-                ))
-        if not records:
-            print(f"  [Stasher] No location cards found for '{city}'")
-        return records
+        print(f"  [Stasher] No location cards found — scanning full page body …")
+        return await _body_text_scan(page, city, scraped_at)
 
     if max_locs and len(location_elements) > max_locs:
         location_elements = location_elements[:max_locs]
@@ -378,11 +411,36 @@ async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -
                 ))
                 print(f"  [Stasher] [{i+1}] {name}: {currency}{price}/{unit}")
             else:
-                print(f"  [Stasher] [{i+1}] {name}: no price found in card text")
+                # Try parent element text as well (in case price is outside the anchor)
+                try:
+                    parent_text = await loc_el.locator("xpath=..").inner_text(timeout=1_000)
+                    price, currency, unit = _parse_price_text(parent_text)
+                    if price > 0:
+                        records.append(PriceRecord(
+                            company="Stasher",
+                            city=city,
+                            location_name=name or f"Stasher location {i+1}",
+                            address=address,
+                            size="flat-rate",
+                            price=price,
+                            currency=currency or "GBP",
+                            price_unit=unit or "day",
+                            scraped_at=scraped_at,
+                        ))
+                        print(f"  [Stasher] [{i+1}] {name}: {currency}{price}/{unit} (from parent)")
+                    else:
+                        print(f"  [Stasher] [{i+1}] {name}: no price found in card text")
+                except Exception:
+                    print(f"  [Stasher] [{i+1}] {name}: no price found in card text")
 
         except Exception as e:
             print(f"  [Stasher] Error on location #{i+1}: {e}")
             continue
+
+    # If card iteration found nothing, fall back to full body scan
+    if not records:
+        print(f"  [Stasher] No prices in cards — scanning full page body …")
+        return await _body_text_scan(page, city, scraped_at)
 
     return records
 
@@ -407,16 +465,23 @@ async def scrape_city(
 
     slug = _city_to_slug(city)
     country = _get_country(city)
-    city_url = CITY_PAGE_TEMPLATE.format(country=country, slug=slug)
+    city_url = CITY_PAGE_SIMPLE.format(slug=slug)
     print(f"[{city}] [Stasher] Navigating to {city_url} …")
 
     try:
-        resp = await page.goto(city_url, wait_until="domcontentloaded", timeout=30_000)
+        resp = await page.goto(city_url, wait_until="networkidle", timeout=45_000)
         if resp and resp.status >= 400:
-            print(f"[{city}] [Stasher] Direct URL returned HTTP {resp.status} — trying homepage search")
-            await _search_for_city(page, city, delay)
+            fallback_url = CITY_PAGE_TEMPLATE.format(country=country, slug=slug)
+            print(f"[{city}] [Stasher] Trying {fallback_url} …")
+            try:
+                resp2 = await page.goto(fallback_url, wait_until="networkidle", timeout=45_000)
+                if resp2 and resp2.status >= 400:
+                    print(f"[{city}] [Stasher] Both URLs failed — trying homepage search")
+                    await _search_for_city(page, city, delay)
+            except Exception:
+                await _search_for_city(page, city, delay)
     except Exception as e:
-        print(f"[{city}] [Stasher] Direct URL failed ({e}) — trying homepage search")
+        print(f"[{city}] [Stasher] Navigation failed ({e}) — trying homepage search")
         await _search_for_city(page, city, delay)
 
     await asyncio.sleep(delay)
