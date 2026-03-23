@@ -245,6 +245,7 @@ def _parse_report_tool_call(
             continue
         try:
             records.append(PriceRecord(
+                company="Bounce",
                 city=city,
                 location_name=loc.get("location_name") or "Unknown",
                 address=loc.get("address") or "",

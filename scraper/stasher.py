@@ -1,0 +1,435 @@
+"""
+Stasher (stasher.com) pricing extractor.
+
+Strategy:
+  1. Intercept XHR/fetch responses to find an internal JSON API for stashpoints/prices.
+  2. If API data is found, parse it directly (fast, reliable).
+  3. Fall back to DOM scraping: navigate to city page → iterate location cards → parse prices.
+
+URL pattern: https://stasher.com/luggage-storage/{country}/{city-slug}
+Pricing model: flat rate — all bag sizes charged the same daily rate per location.
+"""
+import asyncio
+import re
+from datetime import datetime, timezone
+from typing import Any
+
+from playwright.async_api import Page, Response
+
+from scraper.models import PriceRecord
+
+
+BASE_URL = "https://stasher.com"
+CITY_PAGE_TEMPLATE = BASE_URL + "/luggage-storage/{country}/{slug}"
+
+# Currency symbol → ISO code mapping
+CURRENCY_MAP = {
+    "£": "GBP",
+    "$": "USD",
+    "€": "EUR",
+    "¥": "JPY",
+    "A$": "AUD",
+    "C$": "CAD",
+}
+
+_PRICE_RE = re.compile(
+    r"([£$€¥]|A\$|C\$)\s*([\d,]+(?:\.\d+)?)\s*/?\s*(?:bag\s*/\s*)?(\w+)",
+    re.IGNORECASE,
+)
+
+# Curated city → country slug map for Stasher URL construction
+CITY_TO_COUNTRY: dict[str, str] = {
+    "marseille": "france",
+    "paris": "france",
+    "lyon": "france",
+    "nice": "france",
+    "bordeaux": "france",
+    "toulouse": "france",
+    "strasbourg": "france",
+    "barcelona": "spain",
+    "madrid": "spain",
+    "seville": "spain",
+    "valencia": "spain",
+    "malaga": "spain",
+    "london": "united-kingdom",
+    "edinburgh": "united-kingdom",
+    "manchester": "united-kingdom",
+    "birmingham": "united-kingdom",
+    "glasgow": "united-kingdom",
+    "liverpool": "united-kingdom",
+    "rome": "italy",
+    "milan": "italy",
+    "florence": "italy",
+    "venice": "italy",
+    "naples": "italy",
+    "amsterdam": "netherlands",
+    "rotterdam": "netherlands",
+    "berlin": "germany",
+    "munich": "germany",
+    "hamburg": "germany",
+    "cologne": "germany",
+    "frankfurt": "germany",
+    "lisbon": "portugal",
+    "porto": "portugal",
+    "prague": "czech-republic",
+    "vienna": "austria",
+    "brussels": "belgium",
+    "zurich": "switzerland",
+    "geneva": "switzerland",
+    "new york": "united-states",
+    "los angeles": "united-states",
+    "chicago": "united-states",
+    "san francisco": "united-states",
+    "miami": "united-states",
+    "tokyo": "japan",
+    "osaka": "japan",
+    "sydney": "australia",
+    "melbourne": "australia",
+    "toronto": "canada",
+    "vancouver": "canada",
+}
+
+
+def _city_to_slug(city: str) -> str:
+    """Convert 'New York' → 'new-york'."""
+    import unicodedata
+    s = city.strip().lower()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return s.replace(" ", "-")
+
+
+def _get_country(city: str) -> str:
+    """Look up country for a city; fall back to 'unknown'."""
+    return CITY_TO_COUNTRY.get(city.strip().lower(), "unknown")
+
+
+# ---------------------------------------------------------------------------
+# API interception
+# ---------------------------------------------------------------------------
+
+class _ApiCollector:
+    """Accumulates JSON responses that look like stashpoint/pricing data."""
+
+    def __init__(self) -> None:
+        self.locations: list[dict[str, Any]] = []
+
+    async def handle_response(self, response: Response) -> None:
+        url = response.url
+        if not any(kw in url for kw in ("stash", "location", "search", "storage", "venue", "spot", "availab")):
+            return
+        if response.status != 200:
+            return
+        if "json" not in response.headers.get("content-type", ""):
+            return
+        try:
+            body = await response.json()
+            if isinstance(body, list) and body:
+                self.locations.extend(body)
+            elif isinstance(body, dict):
+                for key in ("data", "results", "locations", "stashpoints", "items", "venues", "spots"):
+                    if key in body and isinstance(body[key], list):
+                        self.locations.extend(body[key])
+                        break
+        except Exception:
+            pass
+
+
+def _parse_api_locations(raw: list[dict], city: str, scraped_at: datetime) -> list[PriceRecord]:
+    records: list[PriceRecord] = []
+    for loc in raw:
+        name = (
+            loc.get("name") or loc.get("title") or loc.get("storeName")
+            or loc.get("venue_name") or loc.get("stashpoint_name") or "Unknown"
+        )
+        address = (
+            loc.get("address") or loc.get("full_address")
+            or loc.get("formattedAddress") or ""
+        )
+        # Stasher uses flat-rate pricing — look for a single daily price field
+        price_val = (
+            loc.get("price") or loc.get("dailyPrice") or loc.get("price_per_day")
+            or loc.get("pricePerDay") or loc.get("rate") or 0
+        )
+        currency = (
+            loc.get("currency") or loc.get("currencyCode") or loc.get("currency_code") or "GBP"
+        )
+        if not price_val:
+            # Try nested pricing object
+            pricing = loc.get("pricing") or loc.get("prices") or {}
+            if isinstance(pricing, dict):
+                price_val = (
+                    pricing.get("daily") or pricing.get("perDay")
+                    or pricing.get("price") or pricing.get("amount") or 0
+                )
+
+        if price_val and float(price_val) > 0:
+            records.append(PriceRecord(
+                company="Stasher",
+                city=city,
+                location_name=str(name),
+                address=str(address),
+                size="flat-rate",
+                price=float(price_val),
+                currency=str(currency).upper(),
+                price_unit="day",
+                scraped_at=scraped_at,
+            ))
+    return records
+
+
+# ---------------------------------------------------------------------------
+# DOM scraping helpers
+# ---------------------------------------------------------------------------
+
+def _parse_price_text(text: str) -> tuple[float, str, str]:
+    """Parse '£5.99 bag/day' → (5.99, 'GBP', 'day'). Returns (0, '', '') on failure."""
+    m = _PRICE_RE.search(text)
+    if not m:
+        return 0.0, "", ""
+    symbol, amount_str, unit = m.group(1), m.group(2), m.group(3)
+    amount = float(amount_str.replace(",", ""))
+    currency = CURRENCY_MAP.get(symbol, symbol)
+    return amount, currency, unit.lower()
+
+
+async def _navigate_to_city(page: Page, city: str, delay: float) -> bool:
+    slug = _city_to_slug(city)
+    country = _get_country(city)
+    url = CITY_PAGE_TEMPLATE.format(country=country, slug=slug)
+    print(f"  [Stasher] Trying direct URL: {url}")
+    try:
+        resp = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        if resp and resp.status >= 400:
+            print(f"  [Stasher] Direct URL returned HTTP {resp.status} — will try search")
+            return False
+        await asyncio.sleep(delay)
+        return True
+    except Exception as e:
+        print(f"  [Stasher] Direct URL failed: {e}")
+        return False
+
+
+async def _search_for_city(page: Page, city: str, delay: float) -> bool:
+    await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30_000)
+    await asyncio.sleep(2)
+
+    search_selectors = [
+        'input[placeholder*="city" i]',
+        'input[placeholder*="location" i]',
+        'input[placeholder*="where" i]',
+        'input[placeholder*="search" i]',
+        'input[placeholder*="store" i]',
+        'input[placeholder*="address" i]',
+        'input[type="search"]',
+        'input[name="search"]',
+        'input[name="location"]',
+        '[data-testid*="search"] input',
+        '[class*="search"] input',
+        'form input[type="text"]',
+    ]
+    search_input = None
+    for sel in search_selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=1_500):
+                search_input = el
+                print(f"  [Stasher] Found search input via: {sel}")
+                break
+        except Exception:
+            continue
+
+    if search_input is None:
+        print(f"  [Stasher] Could not find search input for '{city}'")
+        return False
+
+    await search_input.click()
+    await search_input.fill(city)
+    await asyncio.sleep(1)
+
+    suggestion_selectors = [
+        '[role="option"]',
+        '[class*="suggestion"]',
+        '[class*="autocomplete"] li',
+        '[class*="dropdown"] li',
+        '[data-testid*="suggestion"]',
+        'ul[class*="search"] li',
+        'ul[class*="result"] li',
+    ]
+    for sel in suggestion_selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=2_000):
+                await el.click()
+                await asyncio.sleep(delay)
+                return True
+        except Exception:
+            continue
+
+    await search_input.press("Enter")
+    await asyncio.sleep(delay)
+    return True
+
+
+async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -> list[PriceRecord]:
+    records: list[PriceRecord] = []
+    scraped_at = datetime.now(timezone.utc)
+
+    navigated = await _navigate_to_city(page, city, delay)
+    if not navigated:
+        ok = await _search_for_city(page, city, delay)
+        if not ok:
+            return records
+
+    location_selectors = [
+        '[data-testid*="stashpoint"]',
+        '[data-testid*="location"]',
+        '[class*="stashpoint"]',
+        '[class*="StashPoint"]',
+        '[class*="location-card"]',
+        '[class*="LocationCard"]',
+        '[class*="store-card"]',
+        '[class*="result-item"]',
+        '[class*="storage-location"]',
+        'li[class*="listing"]',
+        'article[class*="location"]',
+        'a[href*="/luggage-storage/"]',
+    ]
+    location_elements = []
+    for sel in location_selectors:
+        els = page.locator(sel)
+        count = await els.count()
+        if count > 0:
+            location_elements = [els.nth(i) for i in range(count)]
+            print(f"  [Stasher] Found {count} locations using selector '{sel}'")
+            break
+
+    if not location_elements:
+        # Last resort: scan page text for price patterns
+        all_text = await page.inner_text("body")
+        price_re = re.compile(
+            r"([£$€])\s*([\d.]+)\s*/?\s*(?:bag\s*/\s*)?day",
+            re.IGNORECASE,
+        )
+        seen: set[float] = set()
+        for m in price_re.finditer(all_text):
+            symbol, amount_str = m.group(1), m.group(2)
+            price = float(amount_str)
+            if price > 0 and price not in seen:
+                seen.add(price)
+                currency = CURRENCY_MAP.get(symbol, "GBP")
+                records.append(PriceRecord(
+                    company="Stasher",
+                    city=city,
+                    location_name="Stasher location",
+                    address="",
+                    size="flat-rate",
+                    price=price,
+                    currency=currency,
+                    price_unit="day",
+                    scraped_at=scraped_at,
+                ))
+        if not records:
+            print(f"  [Stasher] No location cards found for '{city}'")
+        return records
+
+    if max_locs and len(location_elements) > max_locs:
+        location_elements = location_elements[:max_locs]
+
+    for i, loc_el in enumerate(location_elements):
+        try:
+            # Extract name
+            name = ""
+            for sel in ('[class*="name"]', '[class*="title"]', 'h2', 'h3', 'strong'):
+                try:
+                    t = await loc_el.locator(sel).first.inner_text(timeout=1_000)
+                    if t.strip():
+                        name = t.strip()
+                        break
+                except Exception:
+                    continue
+
+            # Extract address
+            address = ""
+            for sel in ('[class*="address"]', '[class*="subtitle"]', 'p', 'span'):
+                try:
+                    t = await loc_el.locator(sel).first.inner_text(timeout=1_000)
+                    if t.strip():
+                        address = t.strip()
+                        break
+                except Exception:
+                    continue
+
+            # Extract price from card text
+            card_text = await loc_el.inner_text(timeout=2_000)
+            price, currency, unit = _parse_price_text(card_text)
+
+            if price > 0:
+                records.append(PriceRecord(
+                    company="Stasher",
+                    city=city,
+                    location_name=name or f"Stasher location {i+1}",
+                    address=address,
+                    size="flat-rate",
+                    price=price,
+                    currency=currency or "GBP",
+                    price_unit=unit or "day",
+                    scraped_at=scraped_at,
+                ))
+                print(f"  [Stasher] [{i+1}] {name}: {currency}{price}/{unit}")
+            else:
+                print(f"  [Stasher] [{i+1}] {name}: no price found in card text")
+
+        except Exception as e:
+            print(f"  [Stasher] Error on location #{i+1}: {e}")
+            continue
+
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Public interface
+# ---------------------------------------------------------------------------
+
+async def scrape_city(
+    page: Page,
+    city: str,
+    delay: float = 2.0,
+    max_locations: int = 0,
+) -> list[PriceRecord]:
+    """
+    Scrape pricing for all Stasher locations in *city*.
+    API interception first; falls back to DOM scraping.
+    """
+    scraped_at = datetime.now(timezone.utc)
+    collector = _ApiCollector()
+    page.on("response", lambda r: asyncio.ensure_future(collector.handle_response(r)))
+
+    slug = _city_to_slug(city)
+    country = _get_country(city)
+    city_url = CITY_PAGE_TEMPLATE.format(country=country, slug=slug)
+    print(f"[{city}] [Stasher] Navigating to {city_url} …")
+
+    try:
+        resp = await page.goto(city_url, wait_until="domcontentloaded", timeout=30_000)
+        if resp and resp.status >= 400:
+            print(f"[{city}] [Stasher] Direct URL returned HTTP {resp.status} — trying homepage search")
+            await _search_for_city(page, city, delay)
+    except Exception as e:
+        print(f"[{city}] [Stasher] Direct URL failed ({e}) — trying homepage search")
+        await _search_for_city(page, city, delay)
+
+    await asyncio.sleep(delay)
+    await asyncio.sleep(1)
+
+    if collector.locations:
+        print(f"[{city}] [Stasher] API interception succeeded — {len(collector.locations)} location(s) found")
+        records = _parse_api_locations(collector.locations, city, scraped_at)
+        if records:
+            if max_locations:
+                records = records[:max_locations]
+            return records
+        print(f"[{city}] [Stasher] API data found but price fields not recognised — falling back to DOM")
+
+    print(f"[{city}] [Stasher] Falling back to DOM scraping …")
+    return await _dom_scrape_city(page, city, delay, max_locations)

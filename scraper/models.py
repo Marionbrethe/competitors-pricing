@@ -3,10 +3,11 @@ from pydantic import BaseModel, field_validator
 
 
 class PriceRecord(BaseModel):
+    company: str       # "Bounce" | "Stasher" | "Radical Storage"
     city: str
     location_name: str
     address: str
-    size: str          # "small" | "regular" | "odd-sized"
+    size: str          # "small" | "regular" | "odd-sized" | "flat-rate"
     price: float
     currency: str      # e.g. "GBP", "USD", "EUR"
     price_unit: str    # e.g. "day"

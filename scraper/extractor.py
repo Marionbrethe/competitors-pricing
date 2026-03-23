@@ -109,6 +109,7 @@ def _parse_api_locations(raw: list[dict], city: str, scraped_at: datetime) -> li
             for size, price in pricing.items():
                 if isinstance(price, (int, float)):
                     records.append(PriceRecord(
+                        company="Bounce",
                         city=city,
                         location_name=str(name),
                         address=str(address),
@@ -126,6 +127,7 @@ def _parse_api_locations(raw: list[dict], city: str, scraped_at: datetime) -> li
                     currency = item.get("currency") or item.get("currencyCode") or "GBP"
                     if size and price:
                         records.append(PriceRecord(
+                            company="Bounce",
                             city=city,
                             location_name=str(name),
                             address=str(address),
@@ -401,6 +403,7 @@ async def _extract_bag_sizes(
             price, currency, unit = _parse_price_text(price_text)
             if price > 0:
                 records.append(PriceRecord(
+                    company="Bounce",
                     city=city,
                     location_name=loc_name or "Unknown",
                     address=loc_address or "",
@@ -425,6 +428,7 @@ async def _extract_bag_sizes(
             price, currency, unit = _parse_price_text(row_text)
             if size and price > 0:
                 records.append(PriceRecord(
+                    company="Bounce",
                     city=city,
                     location_name=loc_name or "Unknown",
                     address=loc_address or "",

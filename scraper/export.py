@@ -26,7 +26,7 @@ def to_csv(records: list[PriceRecord], output_dir: str = "output", city: str = "
     df = pd.DataFrame(rows)
 
     # Friendly column order
-    col_order = ["city", "location_name", "address", "size", "price", "currency", "price_unit", "scraped_at"]
+    col_order = ["company", "city", "location_name", "address", "size", "price", "currency", "price_unit", "scraped_at"]
     df = df[[c for c in col_order if c in df.columns]]
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
