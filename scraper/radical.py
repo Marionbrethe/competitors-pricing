@@ -357,7 +357,11 @@ async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -
                     ))
                     print(f"  [Radical] [{i+1}] {loc_name}: {currency}{price}/{unit}")
                 else:
-                    print(f"  [Radical] [{i+1}] {loc_name}: no price on individual page")
+                    snippet = page_text.replace("\n", " ").strip()
+                    if i == 0:  # Only log snippet for first failed page
+                        print(f"  [Radical] [{i+1}] no price — page snippet: {snippet[:400]}")
+                    else:
+                        print(f"  [Radical] [{i+1}] {loc_name}: no price on individual page")
 
             except Exception as e:
                 print(f"  [Radical] Error visiting location #{i+1}: {e}")
@@ -436,11 +440,11 @@ async def scrape_city(
     print(f"[{city}] [Radical] Navigating to {city_url} …")
 
     try:
-        resp = await page.goto(city_url, wait_until="domcontentloaded", timeout=30_000)
+        resp = await page.goto(city_url, wait_until="networkidle", timeout=45_000)
         if resp and resp.status >= 400:
             print(f"[{city}] [Radical] Direct URL returned HTTP {resp.status} — trying list URL")
             list_url = CITY_LIST_TEMPLATE.format(slug=slug)
-            resp2 = await page.goto(list_url, wait_until="domcontentloaded", timeout=30_000)
+            resp2 = await page.goto(list_url, wait_until="networkidle", timeout=45_000)
             if resp2 and resp2.status >= 400:
                 print(f"[{city}] [Radical] List URL also failed — trying homepage search")
                 await _search_for_city(page, city, delay)
@@ -449,10 +453,13 @@ async def scrape_city(
         await _search_for_city(page, city, delay)
 
     await asyncio.sleep(delay)
-    await asyncio.sleep(1)
+    await asyncio.sleep(2)
 
     if collector.locations:
         print(f"[{city}] [Radical] API interception succeeded — {len(collector.locations)} location(s) found")
+        # Debug: show keys of first item so we can map price fields
+        first = collector.locations[0]
+        print(f"  [Radical] API first-item keys: {list(first.keys())[:20]}")
         records = _parse_api_locations(collector.locations, city, scraped_at)
         if records:
             if max_locations:

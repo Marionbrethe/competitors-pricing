@@ -489,12 +489,20 @@ async def scrape_city(
 
     if collector.locations:
         print(f"[{city}] [Stasher] API interception succeeded — {len(collector.locations)} location(s) found")
+        first = collector.locations[0]
+        print(f"  [Stasher] API first-item keys: {list(first.keys())[:20]}")
+        # Show values of likely price fields for diagnosis
+        for k, v in first.items():
+            if any(kw in str(k).lower() for kw in ("price", "rate", "cost", "fee", "amount", "currency")):
+                print(f"  [Stasher] API field '{k}': {v!r}")
         records = _parse_api_locations(collector.locations, city, scraped_at)
         if records:
             if max_locations:
                 records = records[:max_locations]
             return records
         print(f"[{city}] [Stasher] API data found but price fields not recognised — falling back to DOM")
+    else:
+        print(f"[{city}] [Stasher] No API data captured")
 
     print(f"[{city}] [Stasher] Falling back to DOM scraping …")
     return await _dom_scrape_city(page, city, delay, max_locations)
