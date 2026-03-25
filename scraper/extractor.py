@@ -601,6 +601,11 @@ async def scrape_city(
 
     if collector.locations:
         print(f"[{city}] API interception succeeded — {len(collector.locations)} location(s) found")
+        first = collector.locations[0]
+        print(f"  [Bounce] First location keys: {list(first.keys())[:25]}")
+        for k, v in first.items():
+            if any(kw in str(k).lower() for kw in ("price", "rate", "cost", "fee", "amount", "currency", "bag", "daily", "per")):
+                print(f"  [Bounce] '{k}': {repr(v)[:120]}")
         records = _parse_api_locations(collector.locations, city, scraped_at)
         if records:
             return records
