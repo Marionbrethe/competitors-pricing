@@ -15,6 +15,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
+
 from playwright.async_api import Page, Response
 
 from scraper.models import PriceRecord
@@ -39,6 +41,27 @@ _PRICE_RE = re.compile(
     r"\s*(?:/|per|a)?\s*(?:bag\s*(?:/|per)\s*)?(\w+)",
     re.IGNORECASE,
 )
+
+# Coordinates for major cities (used in direct API calls)
+CITY_COORDS: dict[str, tuple[float, float]] = {
+    "london": (51.5074, -0.1278),
+    "paris": (48.8566, 2.3522),
+    "barcelona": (41.3851, 2.1734),
+    "madrid": (40.4168, -3.7038),
+    "rome": (41.9028, 12.4964),
+    "milan": (45.4654, 9.1859),
+    "amsterdam": (52.3676, 4.9041),
+    "berlin": (52.5200, 13.4050),
+    "lisbon": (38.7169, -9.1399),
+    "prague": (50.0755, 14.4378),
+    "vienna": (48.2082, 16.3738),
+    "new york": (40.7128, -74.0060),
+    "los angeles": (34.0522, -118.2437),
+    "chicago": (41.8781, -87.6298),
+    "san francisco": (37.7749, -122.4194),
+    "tokyo": (35.6762, 139.6503),
+    "sydney": (-33.8688, 151.2093),
+}
 
 # Curated city → country slug map for Stasher URL construction
 CITY_TO_COUNTRY: dict[str, str] = {
@@ -602,6 +625,67 @@ async def _trigger_search(page: Page, city: str, delay: float) -> bool:
     return False
 
 
+async def _fetch_api_direct(city: str, scraped_at: datetime, max_locs: int) -> list[PriceRecord]:
+    """
+    Try Stasher's backend REST API directly — no browser needed.
+    Attempts several plausible endpoint patterns.
+    """
+    slug = _city_to_slug(city)
+    lat, lng = CITY_COORDS.get(city.lower(), (51.5074, -0.1278))
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": f"https://stasher.com/luggage-storage/{slug}",
+        "Origin": "https://stasher.com",
+    }
+
+    # Try several plausible endpoint + param combinations
+    candidates = [
+        ("https://stasher.com/api/stashpoints", {"city": slug}),
+        ("https://stasher.com/api/stashpoints", {"lat": lat, "lng": lng, "radius": 5000}),
+        ("https://stasher.com/api/v1/stashpoints", {"city": slug}),
+        ("https://stasher.com/api/v2/stashpoints", {"city": slug}),
+        ("https://stasher.com/api/v3/stashpoints", {"city": slug}),
+        ("https://stasher.com/api/search", {"q": city, "type": "stashpoints"}),
+        ("https://stasher.com/api/locations", {"city": slug}),
+    ]
+
+    async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15) as client:
+        for url, params in candidates:
+            try:
+                resp = await client.get(url, params=params)
+                print(f"  [Stasher] Direct API {url}: HTTP {resp.status_code}")
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        continue
+                    # Extract location list from various response shapes
+                    locations: list[dict] = []
+                    if isinstance(data, list) and data and isinstance(data[0], dict):
+                        locations = data
+                    elif isinstance(data, dict):
+                        for key in ("stashpoints", "locations", "results", "data", "items", "venues"):
+                            val = data.get(key)
+                            if isinstance(val, list) and val:
+                                locations = val
+                                break
+                    if locations:
+                        print(f"  [Stasher] Direct API returned {len(locations)} location(s)")
+                        print(f"  [Stasher] First item keys: {list(locations[0].keys())[:20]}")
+                        records = _parse_api_locations(locations, city, scraped_at)
+                        if max_locs:
+                            records = records[:max_locs]
+                        return records
+            except Exception as e:
+                print(f"  [Stasher] Direct API error ({url}): {e}")
+                continue
+
+    return []
+
+
 async def scrape_city(
     page: Page,
     city: str,
@@ -612,11 +696,20 @@ async def scrape_city(
     Scrape pricing for all Stasher locations in *city*.
 
     Strategy:
-    1. Go to homepage, fill in city search, submit → stashpoints load via API
-    2. Capture the resulting JSON API response
+    1. Try direct API call (httpx) — fastest, no browser needed
+    2. Go to homepage, fill in city search, submit → stashpoints load via API
     3. Fall back to city landing page + __NEXT_DATA__ + body text scan
     """
     scraped_at = datetime.now(timezone.utc)
+
+    # Strategy 1: direct API (fast, no browser)
+    print(f"[{city}] [Stasher] Trying direct API …")
+    records = await _fetch_api_direct(city, scraped_at, max_locations)
+    if records:
+        print(f"[{city}] [Stasher] Direct API succeeded — {len(records)} record(s)")
+        return records
+
+    # Strategy 2: browser — homepage search to trigger stashpoint API
     collector = _ApiCollector()
     page.on("response", lambda r: asyncio.ensure_future(collector.handle_response(r)))
 
