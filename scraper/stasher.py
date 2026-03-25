@@ -283,45 +283,58 @@ async def _search_for_city(page: Page, city: str, delay: float) -> bool:
 async def _body_text_scan(page: Page, city: str, scraped_at: datetime) -> list[PriceRecord]:
     """Scan full page body for price patterns — last resort."""
     records: list[PriceRecord] = []
-    try:
-        all_text = await page.inner_text("body")
-    except Exception:
-        return records
-    if not all_text.strip():
-        # Body is empty — diagnose what actually loaded
+    all_text = ""
+    # Try inner_text first (visible text only), then JS eval (includes hidden elements)
+    for getter in [
+        lambda: page.inner_text("body"),
+        lambda: page.evaluate("document.body.innerText"),
+        lambda: page.locator("body").text_content(),
+    ]:
         try:
-            current_url = page.url
-            title = await page.title()
-            html = await page.content()
-            print(f"  [Stasher] Empty body! URL={current_url} title={title!r}")
-            print(f"  [Stasher] HTML snippet: {html[:400]}")
+            all_text = await getter()
+            if all_text and all_text.strip():
+                break
         except Exception:
-            pass
+            continue
+    if not all_text or not all_text.strip():
+        print(f"  [Stasher] Page body completely empty after all attempts")
         return records
     snippet = all_text.replace("\n", " ").strip()
     print(f"  [Stasher] Page snippet: {snippet[:500]}")
-    price_re = re.compile(
-        r"([£$€])\s*([\d.]+)\s*(?:/|per|a)?\s*(?:bag\s*(?:/|per)\s*)?day",
+    # Try strict pattern first: £X.XX/day or £X.XX per day
+    price_re_strict = re.compile(
+        r"([£$€])\s*([\d.]+)\s*(?:/|per|a)\s*(?:bag\s*(?:/|per)\s*)?day",
         re.IGNORECASE,
     )
+    # Loose fallback: "from £X.XX" without unit
+    price_re_loose = re.compile(r"from\s+([£$€])\s*([\d.]+)\b", re.IGNORECASE)
+
     seen: set[float] = set()
-    for m in price_re.finditer(all_text):
+    for m in price_re_strict.finditer(all_text):
         symbol, amount_str = m.group(1), m.group(2)
         price = float(amount_str)
         if price > 0 and price not in seen:
             seen.add(price)
             currency = CURRENCY_MAP.get(symbol, "GBP")
             records.append(PriceRecord(
-                company="Stasher",
-                city=city,
-                location_name="Stasher location",
-                address="",
-                size="flat-rate",
-                price=price,
-                currency=currency,
-                price_unit="day",
-                scraped_at=scraped_at,
+                company="Stasher", city=city,
+                location_name="Stasher location", address="",
+                size="flat-rate", price=price, currency=currency,
+                price_unit="day", scraped_at=scraped_at,
             ))
+    if not records:
+        for m in price_re_loose.finditer(all_text):
+            symbol, amount_str = m.group(1), m.group(2)
+            price = float(amount_str)
+            if 1.0 <= price <= 100.0 and price not in seen:
+                seen.add(price)
+                currency = CURRENCY_MAP.get(symbol, "GBP")
+                records.append(PriceRecord(
+                    company="Stasher", city=city,
+                    location_name="Stasher location", address="",
+                    size="flat-rate", price=price, currency=currency,
+                    price_unit="day", scraped_at=scraped_at,
+                ))
     if records:
         print(f"  [Stasher] Body scan found {len(records)} distinct price(s)")
     else:
