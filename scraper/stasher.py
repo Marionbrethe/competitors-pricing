@@ -972,31 +972,42 @@ async def scrape_city(
     city: str,
     delay: float = 2.0,
     max_locations: int = 0,
+    headless: bool = True,
 ) -> list[PriceRecord]:
     """
     Scrape pricing for all Stasher locations in *city*.
 
-    Strategy:
-    1. Try direct API call (httpx) — fastest, no browser needed
-    2. Navigate to city page with date param → intercept stashpoint API calls
-    3. Try homepage search to trigger API
-    4. Fall back to __NEXT_DATA__ + body text scan
+    Strategy (headless mode):
+    1a. Sitemap → fetch individual stashpoint pages via httpx (no browser, bypasses anti-bot)
+    1b. Direct API (httpx) — fast, no browser
+    2.  City page navigation + API interception
+    3.  Homepage search
+    4.  DOM + body text scan
+
+    Strategy (headed mode — real visible browser, bypasses anti-bot):
+    1.  City page navigation + API interception (should work with real browser)
+    2.  Sitemap fallback if browser approach yields nothing
     """
     scraped_at = datetime.now(timezone.utc)
 
-    # Strategy 1a: sitemap → individual stashpoint pages via httpx (no browser, bypasses anti-bot)
-    print(f"[{city}] [Stasher] Trying sitemap scrape …")
-    records = await _fetch_via_sitemap(city, scraped_at, max_locations)
-    if records:
-        print(f"[{city}] [Stasher] Sitemap scrape succeeded — {len(records)} record(s)")
-        return records
+    if not headless:
+        # Headed browser: go straight to city page — anti-bot won't block a real browser
+        print(f"[{city}] [Stasher] Headed mode — trying browser API interception first …")
+        # (fall through to strategy 2 below)
+    else:
+        # Headless: sitemap is faster and more reliable than the blocked browser
+        print(f"[{city}] [Stasher] Trying sitemap scrape …")
+        records = await _fetch_via_sitemap(city, scraped_at, max_locations)
+        if records:
+            print(f"[{city}] [Stasher] Sitemap scrape succeeded — {len(records)} record(s)")
+            return records
 
-    # Strategy 1b: direct API (fast, no browser)
-    print(f"[{city}] [Stasher] Trying direct API …")
-    records = await _fetch_api_direct(city, scraped_at, max_locations)
-    if records:
-        print(f"[{city}] [Stasher] Direct API succeeded — {len(records)} record(s)")
-        return records
+        # Strategy 1b: direct API (fast, no browser)
+        print(f"[{city}] [Stasher] Trying direct API …")
+        records = await _fetch_api_direct(city, scraped_at, max_locations)
+        if records:
+            print(f"[{city}] [Stasher] Direct API succeeded — {len(records)} record(s)")
+            return records
 
     # Strategy 2: navigate directly to city page with date — intercept the stashpoint API call
     collector = _ApiCollector()
@@ -1151,4 +1162,13 @@ async def scrape_city(
         except Exception:
             continue
 
-    return await _dom_scrape_city(page, city, delay, max_locations)
+    dom_records = await _dom_scrape_city(page, city, delay, max_locations)
+    if dom_records:
+        return dom_records
+
+    # Last resort for headed mode: sitemap fallback
+    if not headless:
+        print(f"[{city}] [Stasher] Browser yielded nothing — falling back to sitemap …")
+        return await _fetch_via_sitemap(city, scraped_at, max_locations)
+
+    return []

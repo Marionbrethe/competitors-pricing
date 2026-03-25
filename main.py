@@ -82,12 +82,15 @@ async def _scrape_city_all_companies(
             "error_message": None,
         }
         try:
+            # Pass headless flag to stasher so it can choose browser vs sitemap strategy
+            extra_kwargs = {"headless": headless} if company_name == "Stasher" else {}
             async with new_page(headless=headless) as page:
                 result = await module.scrape_city(
                     page=page,
                     city=city,
                     delay=delay,
                     max_locations=max_locations,
+                    **extra_kwargs,
                 )
             if result:
                 records.extend(result)
