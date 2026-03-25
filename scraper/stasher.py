@@ -139,17 +139,21 @@ class _ApiCollector:
 
     def __init__(self) -> None:
         self.locations: list[dict[str, Any]] = []
+        self.all_urls: list[str] = []  # log ALL JSON response URLs for diagnosis
 
     async def handle_response(self, response: Response) -> None:
         if response.status != 200:
             return
         if "json" not in response.headers.get("content-type", ""):
             return
+        url = response.url
         try:
             body = await response.json()
             if isinstance(body, list) and body and isinstance(body[0], dict):
+                self.all_urls.append(f"LIST({len(body)}) {url}")
                 self.locations.extend(body)
             elif isinstance(body, dict):
+                self.all_urls.append(f"DICT({list(body.keys())[:6]}) {url}")
                 for key in ("data", "results", "locations", "stashpoints", "items", "venues", "spots"):
                     if key in body and isinstance(body[key], list) and body[key]:
                         self.locations.extend(body[key])
@@ -751,11 +755,30 @@ async def scrape_city(
             except Exception as e:
                 print(f"  [Stasher] {url} failed: {e}")
 
+    # Try scrolling to trigger lazy-loaded stashpoints, then wait more
+    if city_page_loaded:
+        try:
+            await page.evaluate("window.scrollTo(0, 600)")
+            await asyncio.sleep(2)
+            await page.evaluate("window.scrollTo(0, 1200)")
+            await asyncio.sleep(2)
+        except Exception:
+            pass
+
+    # Log ALL JSON responses captured (for diagnosis)
+    if collector.all_urls:
+        print(f"  [Stasher] JSON responses during city page load:")
+        for u in collector.all_urls[:15]:
+            print(f"    {u}")
+
     # Check if city page navigation triggered any API calls
     if collector.locations:
         print(f"[{city}] [Stasher] City page API: {len(collector.locations)} location(s)")
         first = collector.locations[0]
         print(f"  [Stasher] API keys: {list(first.keys())[:20]}")
+        for k, v in first.items():
+            if any(kw in str(k).lower() for kw in ("price", "rate", "cost", "fee", "amount", "currency")):
+                print(f"  [Stasher] '{k}': {repr(v)[:120]}")
         records = _parse_api_locations(collector.locations, city, scraped_at)
         if records:
             if max_locations:

@@ -58,6 +58,16 @@ class _ApiCollector:
         try:
             body = await response.json()
             if isinstance(body, list) and body and isinstance(body[0], dict):
+                # Filter out JS source map / config objects (regexp, originalSource, etc.)
+                first = body[0]
+                js_keys = {"regexp", "originalsource", "sources", "mappings", "sourcescontent"}
+                item_keys = {k.lower() for k in first.keys()}
+                if js_keys & item_keys:  # intersection — these are JS artifacts, not locations
+                    return
+                # Must look like a location: has name or id or lat/lng
+                location_keys = {"name", "title", "id", "lat", "latitude", "address", "storename"}
+                if not (location_keys & item_keys):
+                    return
                 self.locations.extend(body)
             elif isinstance(body, dict):
                 for key in ("data", "results", "locations", "items", "venues", "spots", "stores"):
