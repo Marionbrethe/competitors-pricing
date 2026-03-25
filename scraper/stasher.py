@@ -750,76 +750,153 @@ def _extract_price_from_html(html: str) -> tuple[float, str]:
     return 0.0, ""
 
 
+# Regex to find stashpoint sub-links inside area pages
+_SP_LINK_RE = re.compile(
+    r'href="(/luggage-storage/[^"]+/[^"]+/[^"]+/[^"/]+)"',
+)
+
+
+def _extract_stashpoint_sublinks(html: str, area_url: str) -> list[str]:
+    """
+    Find individual stashpoint sub-URLs inside an area page HTML.
+    E.g. /luggage-storage/france/nice/nice-airport/some-shop
+    These have one extra path segment beyond the area URL.
+    """
+    area_path = "/" + area_url.split("stasher.com/", 1)[-1].rstrip("/")
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in _SP_LINK_RE.finditer(html):
+        href = m.group(1)
+        if href.startswith(area_path + "/") and href not in seen:
+            seen.add(href)
+            found.append(BASE_URL + href)
+    return found
+
+
+async def _scrape_stashpoint_page(
+    client: httpx.AsyncClient,
+    url: str,
+    city: str,
+    scraped_at: datetime,
+) -> "PriceRecord | None":
+    """Fetch a single stashpoint page and extract name + price."""
+    try:
+        r = await client.get(url, timeout=20)
+        if r.status_code != 200:
+            return None
+        html = r.text
+
+        name = ""
+        price, currency = 0.0, ""
+
+        m = _NEXT_DATA_RE.search(html)
+        if m:
+            try:
+                nd = json.loads(m.group(1))
+                pp = nd.get("props", {}).get("pageProps", {})
+                sp = (pp.get("stashpoint") or pp.get("location") or
+                      pp.get("venue") or pp.get("store") or {})
+                if isinstance(sp, dict):
+                    name = (sp.get("name") or sp.get("title") or sp.get("storeName") or "")
+                    price_val = (sp.get("price") or sp.get("dailyPrice") or
+                                 sp.get("pricePerDay") or sp.get("rate") or 0)
+                    if price_val:
+                        price = float(price_val)
+                        currency = sp.get("currency") or sp.get("currencyCode") or "GBP"
+            except Exception:
+                pass
+
+        if price == 0.0:
+            price, currency = _extract_price_from_html(html)
+
+        if not name:
+            name = url.rstrip("/").split("/")[-1].replace("-", " ").title()
+
+        if price > 0:
+            print(f"  [Stasher] {name}: {currency}{price}/day")
+            return PriceRecord(
+                company="Stasher", city=city,
+                location_name=name, address="",
+                size="flat-rate", price=price,
+                currency=currency or "GBP", price_unit="day",
+                scraped_at=scraped_at,
+            )
+    except Exception as e:
+        print(f"  [Stasher] Error fetching {url}: {e}")
+    return None
+
+
 async def _fetch_via_sitemap(city: str, scraped_at: datetime, max_locs: int) -> list[PriceRecord]:
     """
-    Fetch individual stashpoint pages via sitemap, then scrape each for
-    name + price from __NEXT_DATA__ or page body.
+    Fetch area pages from sitemap, look for individual stashpoint sub-links on each,
+    fetch those for name + price. Falls back to area-level price if no sub-links found.
     """
     headers = _make_headers()
     async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=20) as client:
-        urls = await _find_stashpoint_urls_from_sitemap(client, city, max_locs)
-        if not urls:
+        area_urls = await _find_stashpoint_urls_from_sitemap(client, city, 0)
+        if not area_urls:
             return []
 
-        records: list[PriceRecord] = []
-        for url in urls:
+        # Step 1: collect all individual stashpoint URLs by scanning area pages
+        all_sp_urls: list[str] = []
+        area_html_cache: dict[str, str] = {}  # url → html, reuse for price extraction
+
+        for area_url in area_urls:
             try:
-                r = await client.get(url, timeout=20)
+                r = await client.get(area_url, timeout=20)
                 if r.status_code != 200:
                     continue
-
                 html = r.text
+                area_html_cache[area_url] = html
+                sub = _extract_stashpoint_sublinks(html, area_url)
+                if sub:
+                    all_sp_urls.extend(sub)
+                else:
+                    # No sub-links: treat the area page itself as one location
+                    all_sp_urls.append(area_url)
+            except Exception:
+                all_sp_urls.append(area_url)  # fallback: keep area as location
 
-                # Try __NEXT_DATA__ first
-                name = ""
-                price, currency = 0.0, ""
+        # Deduplicate, apply max_locs limit
+        seen: set[str] = set()
+        unique_urls: list[str] = []
+        for u in all_sp_urls:
+            if u not in seen:
+                seen.add(u)
+                unique_urls.append(u)
 
-                m = _NEXT_DATA_RE.search(html)
-                if m:
-                    try:
-                        nd = json.loads(m.group(1))
-                        pp = nd.get("props", {}).get("pageProps", {})
-                        # Common stashpoint page structures
-                        sp = (pp.get("stashpoint") or pp.get("location") or
-                              pp.get("venue") or pp.get("store") or {})
-                        if isinstance(sp, dict):
-                            name = (sp.get("name") or sp.get("title") or
-                                    sp.get("storeName") or "")
-                            price_val = (sp.get("price") or sp.get("dailyPrice") or
-                                         sp.get("pricePerDay") or sp.get("rate") or 0)
-                            if price_val:
-                                price = float(price_val)
-                                currency = sp.get("currency") or sp.get("currencyCode") or "GBP"
-                    except Exception:
-                        pass
+        print(f"  [Stasher] {len(area_urls)} area pages → {len(unique_urls)} stashpoint URLs")
 
-                # Fall back to regex on full HTML
-                if price == 0.0:
-                    price, currency = _extract_price_from_html(html)
+        if max_locs:
+            unique_urls = unique_urls[:max_locs]
 
-                # Derive name from URL slug if not found in data
-                if not name:
-                    url_slug = url.rstrip("/").split("/")[-1]
-                    name = url_slug.replace("-", " ").title()
-
+        # Step 2: scrape each stashpoint URL
+        records: list[PriceRecord] = []
+        for url in unique_urls:
+            html = area_html_cache.get(url)
+            if html:
+                # Already fetched (area page used as location)
+                name = url.rstrip("/").split("/")[-1].replace("-", " ").title()
+                price, currency = _extract_price_from_html(html)
+                if not price:
+                    # Try __NEXT_DATA__
+                    rec = await _scrape_stashpoint_page(client, url, city, scraped_at)
+                    if rec:
+                        records.append(rec)
+                    continue
                 if price > 0:
-                    print(f"  [Stasher] {name}: {currency}{price}/day (from {url})")
+                    print(f"  [Stasher] {name}: {currency}{price}/day")
                     records.append(PriceRecord(
-                        company="Stasher",
-                        city=city,
-                        location_name=name,
-                        address="",
-                        size="flat-rate",
-                        price=price,
-                        currency=currency or "GBP",
-                        price_unit="day",
+                        company="Stasher", city=city,
+                        location_name=name, address="",
+                        size="flat-rate", price=price,
+                        currency=currency or "GBP", price_unit="day",
                         scraped_at=scraped_at,
                     ))
-                else:
-                    print(f"  [Stasher] {name}: no price found at {url}")
-            except Exception as e:
-                print(f"  [Stasher] Error fetching {url}: {e}")
-                continue
+            else:
+                rec = await _scrape_stashpoint_page(client, url, city, scraped_at)
+                if rec:
+                    records.append(rec)
 
     return records
 
