@@ -10,6 +10,7 @@ URL pattern: https://stasher.com/luggage-storage/{country}/{city-slug}
 Pricing model: flat rate — all bag sizes charged the same daily rate per location.
 """
 import asyncio
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -280,6 +281,68 @@ async def _search_for_city(page: Page, city: str, delay: float) -> bool:
     return True
 
 
+def _walk_json_for_stashpoints(obj: Any, results: list[dict]) -> None:
+    """Recursively walk JSON looking for lists of objects with a 'name' and price field."""
+    if isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, dict):
+                # Stashpoint-like object: has a name AND some price/rate field
+                keys = set(k.lower() for k in item.keys())
+                has_name = any(k in keys for k in ("name", "title", "venue_name"))
+                has_price = any(k in keys for k in ("price", "rate", "daily", "per_day",
+                                                     "price_per_day", "daily_rate", "priceperday",
+                                                     "dailyprice", "amount", "fee"))
+                if has_name and has_price:
+                    results.append(item)
+                else:
+                    _walk_json_for_stashpoints(item, results)
+            else:
+                _walk_json_for_stashpoints(item, results)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _walk_json_for_stashpoints(v, results)
+
+
+async def _extract_next_data(page: Page, city: str, scraped_at: datetime) -> list[PriceRecord]:
+    """
+    Extract pricing from Stasher's embedded Next.js __NEXT_DATA__ script tag.
+    This is more reliable than text scanning.
+    """
+    try:
+        raw = await page.evaluate(
+            "() => { const el = document.getElementById('__NEXT_DATA__'); return el ? el.textContent : null; }"
+        )
+        if not raw:
+            return []
+        data = json.loads(raw)
+        page_props = data.get("props", {}).get("pageProps", {})
+        print(f"  [Stasher] __NEXT_DATA__ pageProps keys: {list(page_props.keys())[:15]}")
+
+        # Try known locations for stashpoint lists
+        candidates: list[dict] = []
+        for key in ("stashpoints", "locations", "venues", "spots", "results", "data", "items"):
+            val = page_props.get(key)
+            if isinstance(val, list) and val and isinstance(val[0], dict):
+                candidates = val
+                print(f"  [Stasher] Found {len(candidates)} items under pageProps['{key}']")
+                break
+        if not candidates:
+            _walk_json_for_stashpoints(page_props, candidates)
+            if candidates:
+                print(f"  [Stasher] Found {len(candidates)} stashpoint-like items via deep search")
+
+        records = _parse_api_locations(candidates, city, scraped_at)
+        if records:
+            print(f"  [Stasher] Parsed {len(records)} price records from __NEXT_DATA__")
+        else:
+            print(f"  [Stasher] __NEXT_DATA__ found but no recognisable prices")
+        return records
+
+    except Exception as e:
+        print(f"  [Stasher] __NEXT_DATA__ extraction failed: {e}")
+        return []
+
+
 async def _body_text_scan(page: Page, city: str, scraped_at: datetime) -> list[PriceRecord]:
     """Scan full page body for price patterns — last resort."""
     records: list[PriceRecord] = []
@@ -387,7 +450,11 @@ async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -
             break
 
     if not location_elements:
-        print(f"  [Stasher] No location cards found — scanning full page body …")
+        print(f"  [Stasher] No location cards found — trying __NEXT_DATA__ …")
+        records = await _extract_next_data(page, city, scraped_at)
+        if records:
+            return records
+        print(f"  [Stasher] Falling back to body text scan …")
         return await _body_text_scan(page, city, scraped_at)
 
     if max_locs and len(location_elements) > max_locs:
