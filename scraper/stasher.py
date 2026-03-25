@@ -12,7 +12,7 @@ Pricing model: flat rate — all bag sizes charged the same daily rate per locat
 import asyncio
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -219,9 +219,12 @@ def _parse_price_text(text: str) -> tuple[float, str, str]:
 async def _navigate_to_city(page: Page, city: str, delay: float) -> bool:
     slug = _city_to_slug(city)
     country = _get_country(city)
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # Try simple URL first (no country prefix), then country-prefixed URL
+    # Try with date param first (triggers price display), then without
     for url in [
+        CITY_PAGE_SIMPLE.format(slug=slug) + f"?date={tomorrow}&bags=1",
+        CITY_PAGE_TEMPLATE.format(country=country, slug=slug) + f"?date={tomorrow}&bags=1",
         CITY_PAGE_SIMPLE.format(slug=slug),
         CITY_PAGE_TEMPLATE.format(country=country, slug=slug),
     ]:
@@ -641,15 +644,20 @@ async def _fetch_api_direct(city: str, scraped_at: datetime, max_locs: int) -> l
         "Origin": "https://stasher.com",
     }
 
-    # Try several plausible endpoint + param combinations
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Try several plausible endpoint + param combinations, with and without date
     candidates = [
+        ("https://stasher.com/api/stashpoints", {"city": slug, "date": tomorrow, "bags": 1}),
+        ("https://stasher.com/api/stashpoints", {"lat": lat, "lng": lng, "radius": 5000, "date": tomorrow}),
+        ("https://stasher.com/api/v1/stashpoints", {"city": slug, "date": tomorrow}),
+        ("https://stasher.com/api/v2/stashpoints", {"city": slug, "date": tomorrow}),
+        ("https://stasher.com/api/v3/stashpoints", {"city": slug, "date": tomorrow}),
+        ("https://stasher.com/api/search", {"q": city, "date": tomorrow, "type": "stashpoints"}),
+        ("https://stasher.com/api/locations", {"city": slug, "date": tomorrow}),
+        # Without date as fallback
         ("https://stasher.com/api/stashpoints", {"city": slug}),
-        ("https://stasher.com/api/stashpoints", {"lat": lat, "lng": lng, "radius": 5000}),
-        ("https://stasher.com/api/v1/stashpoints", {"city": slug}),
-        ("https://stasher.com/api/v2/stashpoints", {"city": slug}),
         ("https://stasher.com/api/v3/stashpoints", {"city": slug}),
-        ("https://stasher.com/api/search", {"q": city, "type": "stashpoints"}),
-        ("https://stasher.com/api/locations", {"city": slug}),
     ]
 
     async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15) as client:

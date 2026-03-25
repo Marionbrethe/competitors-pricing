@@ -11,7 +11,7 @@ The scraper collects: city, location_name, address, size, price, currency, price
 """
 import asyncio
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from playwright.async_api import Page, Response
@@ -448,6 +448,70 @@ async def _extract_bag_sizes(
 # Public interface
 # ---------------------------------------------------------------------------
 
+async def _set_date(page: Page, delay: float) -> bool:
+    """
+    Inject tomorrow's date into Bounce's date picker so prices load.
+    Returns True if a date was set.
+    """
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    tomorrow_display = (datetime.now() + timedelta(days=1)).strftime("%m/%d/%Y")
+
+    date_selectors = [
+        'input[type="date"]',
+        'input[name*="date" i]',
+        'input[placeholder*="date" i]',
+        'input[id*="date" i]',
+        '[class*="date"] input',
+        '[class*="DatePicker"] input',
+        '[data-testid*="date"] input',
+    ]
+
+    for sel in date_selectors:
+        try:
+            inp = page.locator(sel).first
+            if await inp.is_visible(timeout=1_500):
+                # Set via JS to bypass custom picker widgets
+                await page.evaluate(
+                    f"el => {{ el.value = '{tomorrow}'; el.dispatchEvent(new Event('input', {{bubbles:true}})); el.dispatchEvent(new Event('change', {{bubbles:true}})); }}",
+                    await inp.element_handle(),
+                )
+                await asyncio.sleep(0.5)
+                # Also try filling directly
+                await inp.fill(tomorrow_display)
+                await asyncio.sleep(0.5)
+                await inp.press("Enter")
+                print(f"  [Bounce] Set date to {tomorrow} via {sel}")
+                await asyncio.sleep(delay)
+                return True
+        except Exception:
+            continue
+
+    # Fallback: try clicking a "Today" or calendar button then advance one day
+    for sel in ('[class*="calendar"]', '[class*="datepicker"]', '[aria-label*="date" i]',
+                'button[class*="date"]'):
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=1_000):
+                await btn.click()
+                await asyncio.sleep(1)
+                # Try clicking "next day" arrow
+                for arrow in ('[aria-label*="next" i]', '[class*="next"]', 'button[class*="arrow"]'):
+                    try:
+                        nxt = page.locator(arrow).first
+                        if await nxt.is_visible(timeout=500):
+                            await nxt.click()
+                            await asyncio.sleep(0.5)
+                    except Exception:
+                        pass
+                print(f"  [Bounce] Opened calendar via {sel}")
+                await asyncio.sleep(delay)
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
 async def scrape_city(
     page: Page,
     city: str,
@@ -456,30 +520,40 @@ async def scrape_city(
 ) -> list[PriceRecord]:
     """
     Scrape pricing for all storage locations in *city* from Bounce.
-
-    First attempts API interception; falls back to DOM scraping.
+    Selects tomorrow's date to trigger price display, then captures
+    the API response or falls back to DOM scraping.
     """
     scraped_at = datetime.now(timezone.utc)
     collector = _ApiCollector()
     page.on("response", lambda r: asyncio.ensure_future(collector.handle_response(r)))
 
     slug = _city_to_slug(city)
-    city_url = CITY_PAGE_TEMPLATE.format(slug=slug)
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Try URL with date param first — Bounce may load locations directly
+    city_url = CITY_PAGE_TEMPLATE.format(slug=slug) + f"?date={tomorrow}"
     print(f"[{city}] Navigating to {city_url} …")
 
-    # Try direct city URL first; fall back to homepage search
     try:
-        resp = await page.goto(city_url, wait_until="domcontentloaded", timeout=30_000)
+        resp = await page.goto(city_url, wait_until="networkidle", timeout=45_000)
         if resp and resp.status >= 400:
-            print(f"[{city}] Direct URL returned HTTP {resp.status} — trying homepage search")
+            # Try without date
+            city_url = CITY_PAGE_TEMPLATE.format(slug=slug)
+            resp = await page.goto(city_url, wait_until="networkidle", timeout=45_000)
+    except Exception:
+        try:
+            city_url = CITY_PAGE_TEMPLATE.format(slug=slug)
+            await page.goto(city_url, wait_until="domcontentloaded", timeout=30_000)
+        except Exception as e:
+            print(f"[{city}] Navigation failed ({e}) — trying homepage search")
             await _search_for_city(page, city, delay)
-    except Exception as e:
-        print(f"[{city}] Direct URL failed ({e}) — trying homepage search")
-        await _search_for_city(page, city, delay)
+
+    # Try to set a date if there's a date picker on the page
+    date_set = await _set_date(page, delay)
+    if date_set:
+        await asyncio.sleep(2)  # let locations reload with prices
 
     await asyncio.sleep(delay)
-
-    # Give API calls a moment to complete
     await asyncio.sleep(1)
 
     if collector.locations:
