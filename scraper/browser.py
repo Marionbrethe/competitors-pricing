@@ -24,18 +24,43 @@ async def new_page(headless: bool = True) -> AsyncGenerator[Page, None]:
     """
     Async context manager that yields a stealth-configured Playwright Page.
 
+    In headed mode, tries to launch the user's real installed Chrome first
+    (much harder to detect as automation than Playwright's bundled Chromium).
+    Falls back to bundled Chromium if Chrome is not installed.
+
     Usage:
         async with new_page(headless=True) as page:
             await page.goto("https://www.usebounce.com")
     """
     async with async_playwright() as pw:
-        browser: Browser = await pw.chromium.launch(
-            headless=headless,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
+        launch_args = [
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+        ]
+
+        browser: Browser | None = None
+
+        # In headed mode try real Chrome/Edge first — real browser fingerprints
+        # are far less likely to be flagged by anti-bot services
+        if not headless:
+            for channel in ("chrome", "msedge"):
+                try:
+                    browser = await pw.chromium.launch(
+                        headless=False,
+                        channel=channel,
+                        args=launch_args,
+                    )
+                    print(f"  [browser] Using real {channel} (headed)")
+                    break
+                except Exception:
+                    continue
+
+        if browser is None:
+            browser = await pw.chromium.launch(
+                headless=headless,
+                args=launch_args,
+            )
+
         context: BrowserContext = await browser.new_context(
             user_agent=_USER_AGENT,
             viewport={"width": 1440, "height": 900},

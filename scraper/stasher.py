@@ -1009,56 +1009,114 @@ async def scrape_city(
             print(f"[{city}] [Stasher] Direct API succeeded — {len(records)} record(s)")
             return records
 
-    # Strategy 2: navigate directly to city page with date — intercept the stashpoint API call
+    # Strategy 2: navigate to city page + intercept API + interact with date picker
     collector = _ApiCollector()
     page.on("response", lambda r: asyncio.ensure_future(collector.handle_response(r)))
 
     slug = _city_to_slug(city)
     country = _get_country(city)
     tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    tomorrow_display = (datetime.now() + timedelta(days=1)).strftime("%d/%m/%Y")
 
-    print(f"[{city}] [Stasher] Navigating to city page with date …")
+    print(f"[{city}] [Stasher] Navigating to city page …")
     city_page_loaded = False
     for url in [
-        CITY_PAGE_SIMPLE.format(slug=slug) + f"?date={tomorrow}&bags=1",
-        CITY_PAGE_TEMPLATE.format(country=country, slug=slug) + f"?date={tomorrow}&bags=1",
-        CITY_PAGE_SIMPLE.format(slug=slug),
         CITY_PAGE_TEMPLATE.format(country=country, slug=slug),
+        CITY_PAGE_SIMPLE.format(slug=slug),
+        CITY_PAGE_TEMPLATE.format(country=country, slug=slug) + f"?date={tomorrow}&bags=1",
     ]:
         try:
             print(f"  [Stasher] Trying: {url}")
-            resp = await page.goto(url, wait_until="networkidle", timeout=45_000)
+            resp = await page.goto(url, wait_until="networkidle", timeout=60_000)
             if resp and resp.status < 400:
-                await asyncio.sleep(delay + 2)  # let JS finish
+                # Extra wait for JS hydration — headed browser may render slower
+                await asyncio.sleep(delay + 4)
                 city_page_loaded = True
                 break
         except Exception:
             try:
                 resp = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 if resp and resp.status < 400:
-                    await asyncio.sleep(delay + 4)
+                    await asyncio.sleep(delay + 6)
                     city_page_loaded = True
                     break
             except Exception as e:
                 print(f"  [Stasher] {url} failed: {e}")
 
-    # Try scrolling to trigger lazy-loaded stashpoints, then wait more
     if city_page_loaded:
-        try:
-            await page.evaluate("window.scrollTo(0, 600)")
-            await asyncio.sleep(2)
-            await page.evaluate("window.scrollTo(0, 1200)")
-            await asyncio.sleep(2)
-        except Exception:
-            pass
+        # Scroll to trigger lazy loading
+        for scroll_y in (400, 800, 1200):
+            try:
+                await page.evaluate(f"window.scrollTo(0, {scroll_y})")
+                await asyncio.sleep(1)
+            except Exception:
+                pass
+        await asyncio.sleep(2)
 
-    # Log ALL JSON responses captured (for diagnosis)
+        # Try to interact with the date picker to trigger stashpoint loading
+        date_selectors = [
+            'input[type="date"]',
+            'input[placeholder*="date" i]',
+            'input[placeholder*="when" i]',
+            'input[placeholder*="day" i]',
+            '[class*="date"] input',
+            '[class*="DatePicker"] input',
+            '[class*="datepicker"] input',
+            '[aria-label*="date" i]',
+            'button[class*="date" i]',
+            '[data-testid*="date"]',
+        ]
+        date_set = False
+        for sel in date_selectors:
+            try:
+                el = page.locator(sel).first
+                if await el.is_visible(timeout=1_500):
+                    await el.click()
+                    await asyncio.sleep(0.5)
+                    # Try filling with ISO date
+                    try:
+                        await page.evaluate(
+                            f"el => {{ el.value = '{tomorrow}'; "
+                            f"el.dispatchEvent(new Event('input', {{bubbles:true}})); "
+                            f"el.dispatchEvent(new Event('change', {{bubbles:true}})); }}",
+                            await el.element_handle(),
+                        )
+                    except Exception:
+                        pass
+                    await el.fill(tomorrow_display)
+                    await el.press("Enter")
+                    await asyncio.sleep(delay + 2)
+                    print(f"  [Stasher] Set date via {sel}")
+                    date_set = True
+                    break
+            except Exception:
+                continue
+
+        if not date_set:
+            # Try clicking any visible calendar/date button
+            for sel in ('[class*="calendar" i]', '[class*="datepicker" i]',
+                        'button[aria-label*="date" i]', 'button[class*="search"]',
+                        'button[type="submit"]'):
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.is_visible(timeout=1_000):
+                        await btn.click()
+                        await asyncio.sleep(delay + 2)
+                        print(f"  [Stasher] Clicked {sel}")
+                        break
+                except Exception:
+                    continue
+
+        # After date interaction, wait for any new API responses
+        await asyncio.sleep(3)
+
+    # Log captured API URLs
     if collector.all_urls:
-        print(f"  [Stasher] JSON responses during city page load:")
+        print(f"  [Stasher] JSON responses captured:")
         for u in collector.all_urls[:15]:
             print(f"    {u}")
 
-    # Check if city page navigation triggered any API calls
+    # Check if city page or date interaction triggered stashpoint API calls
     if collector.locations:
         print(f"[{city}] [Stasher] City page API: {len(collector.locations)} location(s)")
         first = collector.locations[0]
