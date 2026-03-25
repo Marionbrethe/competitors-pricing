@@ -540,6 +540,37 @@ async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -
 # Public interface
 # ---------------------------------------------------------------------------
 
+async def _trigger_search(page: Page, city: str, delay: float) -> bool:
+    """
+    After navigating to a Stasher city page, click the search button to
+    load individual stashpoints (they are not present in the initial render).
+    Returns True if a search was triggered.
+    """
+    await asyncio.sleep(1)
+    # Stasher's city page has a pre-filled search widget — just click submit
+    submit_selectors = [
+        'button[type="submit"]',
+        'button[class*="search" i]',
+        'button[class*="Search"]',
+        '[data-testid*="search"] button',
+        'form button',
+        'button[class*="btn" i][class*="primary" i]',
+        '[class*="search-bar"] button',
+        '[class*="SearchBar"] button',
+    ]
+    for sel in submit_selectors:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=2_000):
+                await btn.click()
+                print(f"  [Stasher] Clicked search button ({sel})")
+                await asyncio.sleep(delay + 2)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 async def scrape_city(
     page: Page,
     city: str,
@@ -548,7 +579,12 @@ async def scrape_city(
 ) -> list[PriceRecord]:
     """
     Scrape pricing for all Stasher locations in *city*.
-    API interception first; falls back to DOM scraping.
+
+    Strategy:
+    1. Navigate to city page (stashpoints load only after active search)
+    2. Trigger the search button to load stashpoints
+    3. Capture the resulting JSON API response via interception
+    4. Fall back to __NEXT_DATA__ parsing, then body text scan
     """
     scraped_at = datetime.now(timezone.utc)
     collector = _ApiCollector()
@@ -562,27 +598,21 @@ async def scrape_city(
     try:
         resp = await page.goto(city_url, wait_until="networkidle", timeout=45_000)
         if resp and resp.status >= 400:
-            fallback_url = CITY_PAGE_TEMPLATE.format(country=country, slug=slug)
-            print(f"[{city}] [Stasher] Trying {fallback_url} …")
-            try:
-                resp2 = await page.goto(fallback_url, wait_until="networkidle", timeout=45_000)
-                if resp2 and resp2.status >= 400:
-                    print(f"[{city}] [Stasher] Both URLs failed — trying homepage search")
-                    await _search_for_city(page, city, delay)
-            except Exception:
-                await _search_for_city(page, city, delay)
+            city_url = CITY_PAGE_TEMPLATE.format(country=country, slug=slug)
+            print(f"[{city}] [Stasher] Trying {city_url} …")
+            resp = await page.goto(city_url, wait_until="networkidle", timeout=45_000)
     except Exception as e:
-        print(f"[{city}] [Stasher] Navigation failed ({e}) — trying homepage search")
-        await _search_for_city(page, city, delay)
+        print(f"[{city}] [Stasher] Navigation failed ({e})")
 
-    await asyncio.sleep(delay)
-    await asyncio.sleep(1)
+    # Trigger the search so stashpoints load via API
+    searched = await _trigger_search(page, city, delay)
+    if searched:
+        await asyncio.sleep(2)  # let API response arrive
 
     if collector.locations:
         print(f"[{city}] [Stasher] API interception succeeded — {len(collector.locations)} location(s) found")
         first = collector.locations[0]
         print(f"  [Stasher] API first-item keys: {list(first.keys())[:20]}")
-        # Show values of likely price fields for diagnosis
         for k, v in first.items():
             if any(kw in str(k).lower() for kw in ("price", "rate", "cost", "fee", "amount", "currency")):
                 print(f"  [Stasher] API field '{k}': {v!r}")
@@ -593,7 +623,6 @@ async def scrape_city(
             return records
         print(f"[{city}] [Stasher] API data found but price fields not recognised — falling back to DOM")
     else:
-        print(f"[{city}] [Stasher] No API data captured")
+        print(f"[{city}] [Stasher] No API data captured — falling back to DOM scraping …")
 
-    print(f"[{city}] [Stasher] Falling back to DOM scraping …")
     return await _dom_scrape_city(page, city, delay, max_locations)
