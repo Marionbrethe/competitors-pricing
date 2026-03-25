@@ -705,8 +705,9 @@ async def scrape_city(
 
     Strategy:
     1. Try direct API call (httpx) — fastest, no browser needed
-    2. Go to homepage, fill in city search, submit → stashpoints load via API
-    3. Fall back to city landing page + __NEXT_DATA__ + body text scan
+    2. Navigate to city page with date param → intercept stashpoint API calls
+    3. Try homepage search to trigger API
+    4. Fall back to __NEXT_DATA__ + body text scan
     """
     scraped_at = datetime.now(timezone.utc)
 
@@ -717,18 +718,57 @@ async def scrape_city(
         print(f"[{city}] [Stasher] Direct API succeeded — {len(records)} record(s)")
         return records
 
-    # Strategy 2: browser — homepage search to trigger stashpoint API
+    # Strategy 2: navigate directly to city page with date — intercept the stashpoint API call
     collector = _ApiCollector()
     page.on("response", lambda r: asyncio.ensure_future(collector.handle_response(r)))
 
     slug = _city_to_slug(city)
-    print(f"[{city}] [Stasher] Searching via homepage …")
+    country = _get_country(city)
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
+    print(f"[{city}] [Stasher] Navigating to city page with date …")
+    city_page_loaded = False
+    for url in [
+        CITY_PAGE_SIMPLE.format(slug=slug) + f"?date={tomorrow}&bags=1",
+        CITY_PAGE_TEMPLATE.format(country=country, slug=slug) + f"?date={tomorrow}&bags=1",
+        CITY_PAGE_SIMPLE.format(slug=slug),
+        CITY_PAGE_TEMPLATE.format(country=country, slug=slug),
+    ]:
+        try:
+            print(f"  [Stasher] Trying: {url}")
+            resp = await page.goto(url, wait_until="networkidle", timeout=45_000)
+            if resp and resp.status < 400:
+                await asyncio.sleep(delay + 2)  # let JS finish
+                city_page_loaded = True
+                break
+        except Exception:
+            try:
+                resp = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                if resp and resp.status < 400:
+                    await asyncio.sleep(delay + 4)
+                    city_page_loaded = True
+                    break
+            except Exception as e:
+                print(f"  [Stasher] {url} failed: {e}")
+
+    # Check if city page navigation triggered any API calls
+    if collector.locations:
+        print(f"[{city}] [Stasher] City page API: {len(collector.locations)} location(s)")
+        first = collector.locations[0]
+        print(f"  [Stasher] API keys: {list(first.keys())[:20]}")
+        records = _parse_api_locations(collector.locations, city, scraped_at)
+        if records:
+            if max_locations:
+                records = records[:max_locations]
+            return records
+        print(f"[{city}] [Stasher] Locations found but no recognised price fields — falling back")
+
+    # Strategy 3: homepage search to trigger stashpoint API
+    print(f"[{city}] [Stasher] Searching via homepage …")
     try:
         await page.goto(BASE_URL, wait_until="networkidle", timeout=45_000)
         await asyncio.sleep(2)
 
-        # Find and fill the city search input
         search_filled = False
         for sel in [
             'input[placeholder*="city" i]',
@@ -752,7 +792,6 @@ async def scrape_city(
                 continue
 
         if not search_filled:
-            # Log visible inputs for diagnosis
             try:
                 inputs = await page.evaluate("""
                     () => Array.from(document.querySelectorAll('input'))
@@ -764,7 +803,6 @@ async def scrape_city(
                 pass
 
         if search_filled:
-            # Try clicking an autocomplete suggestion first
             suggestion_clicked = False
             for sel in ['[role="option"]', '[class*="suggestion"]', '[class*="autocomplete"] li',
                         'ul[class*="result"] li', '[class*="dropdown"] li']:
@@ -782,19 +820,14 @@ async def scrape_city(
                 await page.keyboard.press("Enter")
                 print(f"  [Stasher] Pressed Enter to submit search")
 
-            await asyncio.sleep(delay + 3)  # wait for stashpoints to load
+            await asyncio.sleep(delay + 3)
 
     except Exception as e:
         print(f"[{city}] [Stasher] Homepage search failed ({e})")
 
-    # Check if API response was captured
+    # Check if homepage search triggered API calls
     if collector.locations:
-        print(f"[{city}] [Stasher] API captured {len(collector.locations)} location(s)")
-        first = collector.locations[0]
-        print(f"  [Stasher] API keys: {list(first.keys())[:20]}")
-        for k, v in first.items():
-            if any(kw in str(k).lower() for kw in ("price", "rate", "cost", "fee", "amount", "currency")):
-                print(f"  [Stasher] '{k}': {v!r}")
+        print(f"[{city}] [Stasher] Homepage API: {len(collector.locations)} location(s)")
         records = _parse_api_locations(collector.locations, city, scraped_at)
         if records:
             if max_locations:
@@ -802,10 +835,13 @@ async def scrape_city(
             return records
         print(f"[{city}] [Stasher] Locations found but no recognised price fields — falling back")
     else:
-        print(f"[{city}] [Stasher] No API data from homepage search — trying city page …")
+        print(f"[{city}] [Stasher] No API data captured — trying DOM/body scan …")
 
-    # Fallback: navigate directly to city page
-    country = _get_country(city)
+    # Strategy 4: DOM scrape the city page we already loaded
+    if city_page_loaded:
+        return await _dom_scrape_city(page, city, delay, max_locations)
+
+    # Navigate once more if city page never loaded
     for url in [CITY_PAGE_SIMPLE.format(slug=slug),
                 CITY_PAGE_TEMPLATE.format(country=country, slug=slug)]:
         try:

@@ -50,10 +50,6 @@ class _ApiCollector:
         self.locations: list[dict[str, Any]] = []
 
     async def handle_response(self, response: Response) -> None:
-        url = response.url
-        # Bounce likely calls an internal search/availability API
-        if not any(kw in url for kw in ("storage", "location", "search", "venue", "spot")):
-            return
         if response.status != 200:
             return
         content_type = response.headers.get("content-type", "")
@@ -61,12 +57,11 @@ class _ApiCollector:
             return
         try:
             body = await response.json()
-            if isinstance(body, list) and body:
+            if isinstance(body, list) and body and isinstance(body[0], dict):
                 self.locations.extend(body)
             elif isinstance(body, dict):
-                # Try common wrapper keys
-                for key in ("data", "results", "locations", "items", "venues", "spots"):
-                    if key in body and isinstance(body[key], list):
+                for key in ("data", "results", "locations", "items", "venues", "spots", "stores"):
+                    if key in body and isinstance(body[key], list) and body[key]:
                         self.locations.extend(body[key])
                         break
         except Exception:
@@ -298,8 +293,8 @@ async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -
             break
 
     if not location_elements:
-        print(f"  [!] No location cards found for '{city}' — DOM structure may have changed")
-        return records
+        print(f"  [!] No location cards found for '{city}' — trying body text scan …")
+        return await _body_text_scan_bounce(page, city, scraped_at)
 
     if max_locs and len(location_elements) > max_locs:
         location_elements = location_elements[:max_locs]
@@ -330,6 +325,54 @@ async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -
             print(f"  [!] Error on location #{i+1}: {e}")
             continue
 
+    if not records:
+        print(f"  [!] Cards found but no prices extracted — trying body text scan …")
+        return await _body_text_scan_bounce(page, city, scraped_at)
+
+    return records
+
+
+async def _body_text_scan_bounce(page: Page, city: str, scraped_at: datetime) -> list[PriceRecord]:
+    """Scan full page body for Bounce price patterns — last resort."""
+    records: list[PriceRecord] = []
+    all_text = ""
+    for getter in [
+        lambda: page.inner_text("body"),
+        lambda: page.evaluate("document.body.innerText"),
+        lambda: page.locator("body").text_content(),
+    ]:
+        try:
+            all_text = await getter()
+            if all_text and all_text.strip():
+                break
+        except Exception:
+            continue
+    if not all_text or not all_text.strip():
+        return records
+
+    snippet = all_text.replace("\n", " ").strip()
+    print(f"  [Bounce] Page snippet: {snippet[:300]}")
+
+    # Match "£X.XX / day" or "£X.XX/day"
+    price_re = re.compile(r"([£$€])\s*([\d.]+)\s*/\s*day", re.IGNORECASE)
+    seen: set[float] = set()
+    for m in price_re.finditer(all_text):
+        symbol, amount_str = m.group(1), m.group(2)
+        price = float(amount_str)
+        if price > 0 and price not in seen:
+            seen.add(price)
+            currency = CURRENCY_MAP.get(symbol, "GBP")
+            records.append(PriceRecord(
+                company="Bounce", city=city,
+                location_name="Bounce location", address="",
+                size="flat-rate", price=price, currency=currency,
+                price_unit="day", scraped_at=scraped_at,
+            ))
+
+    if records:
+        print(f"  [Bounce] Body scan found {len(records)} distinct price(s)")
+    else:
+        print(f"  [Bounce] No prices found in page body")
     return records
 
 
