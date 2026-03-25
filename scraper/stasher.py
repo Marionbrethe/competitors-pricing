@@ -287,6 +287,17 @@ async def _body_text_scan(page: Page, city: str, scraped_at: datetime) -> list[P
         all_text = await page.inner_text("body")
     except Exception:
         return records
+    if not all_text.strip():
+        # Body is empty — diagnose what actually loaded
+        try:
+            current_url = page.url
+            title = await page.title()
+            html = await page.content()
+            print(f"  [Stasher] Empty body! URL={current_url} title={title!r}")
+            print(f"  [Stasher] HTML snippet: {html[:400]}")
+        except Exception:
+            pass
+        return records
     snippet = all_text.replace("\n", " ").strip()
     print(f"  [Stasher] Page snippet: {snippet[:500]}")
     price_re = re.compile(

@@ -43,6 +43,12 @@ _PRICE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Secondary pattern: "from £7.90" without a time unit (used on listing/area pages)
+_FROM_PRICE_RE = re.compile(
+    r"from\s+([£$€¥]|A\$|C\$)\s*([\d,]+(?:\.\d+)?)\b",
+    re.IGNORECASE,
+)
+
 
 def _city_to_slug(city: str) -> str:
     """Convert 'New York' → 'new-york', stripping accents."""
@@ -138,6 +144,23 @@ def _parse_price_text(text: str) -> tuple[float, str, str]:
         return 0.0, "", ""
     currency = CURRENCY_MAP.get(symbol, symbol)
     return amount, currency, unit.lower()
+
+
+def _parse_price_loose(text: str) -> tuple[float, str]:
+    """
+    Looser parse for 'from £7.90' (no unit) on listing/area pages.
+    Returns (price, currency). Assumes daily rate.
+    Uses > 3.0 floor to skip the £1.90 promo banner.
+    """
+    best = 0.0
+    best_currency = ""
+    for m in _FROM_PRICE_RE.finditer(text):
+        symbol, amount_str = m.group(1), m.group(2)
+        amount = float(amount_str.replace(",", ""))
+        if 3.0 <= amount <= 100.0 and amount > best:
+            best = amount
+            best_currency = CURRENCY_MAP.get(symbol, symbol)
+    return best, best_currency
 
 
 async def _try_navigate(page: Page, url: str, delay: float) -> bool:
@@ -343,6 +366,10 @@ async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -
 
                 page_text = await page.inner_text("body")
                 price, currency, unit = _parse_price_text(page_text)
+                if price <= 0:
+                    # Fallback: "from £X.XX" without unit (common on Radical area pages)
+                    price, currency = _parse_price_loose(page_text)
+                    unit = "day"
                 if price > 0:
                     records.append(PriceRecord(
                         company="Radical Storage",
@@ -352,13 +379,13 @@ async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -
                         size="flat-rate",
                         price=price,
                         currency=currency or "EUR",
-                        price_unit=unit or "day",
+                        price_unit=unit,
                         scraped_at=scraped_at,
                     ))
-                    print(f"  [Radical] [{i+1}] {loc_name}: {currency}{price}/{unit}")
+                    print(f"  [Radical] [{i+1}] {loc_name}: {currency}{price}/day")
                 else:
                     snippet = page_text.replace("\n", " ").strip()
-                    if i == 0:  # Only log snippet for first failed page
+                    if i == 0:
                         print(f"  [Radical] [{i+1}] no price — page snippet: {snippet[:400]}")
                     else:
                         print(f"  [Radical] [{i+1}] {loc_name}: no price on individual page")
