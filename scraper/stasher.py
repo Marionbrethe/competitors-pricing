@@ -12,6 +12,7 @@ Pricing model: flat rate — all bag sizes charged the same daily rate per locat
 import asyncio
 import json
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -632,6 +633,197 @@ async def _trigger_search(page: Page, city: str, delay: float) -> bool:
     return False
 
 
+_NEXT_DATA_RE = re.compile(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.+?)</script>', re.DOTALL)
+_SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+# Price patterns for individual stashpoint pages
+_SP_PRICE_RE = re.compile(
+    r'([£$€])\s*([\d]+(?:\.\d+)?)\s*(?:/|per)\s*(?:bag\s*/\s*)?day',
+    re.IGNORECASE,
+)
+_SP_FROM_RE = re.compile(r'from\s+([£$€])\s*([\d]+(?:\.\d+)?)\b', re.IGNORECASE)
+
+
+def _make_headers() -> dict:
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.9",
+    }
+
+
+async def _find_stashpoint_urls_from_sitemap(
+    client: httpx.AsyncClient, city: str, max_locs: int
+) -> list[str]:
+    """
+    Fetch Stasher's sitemap and return individual stashpoint page URLs for *city*.
+    Returns a list of absolute URLs, limited to max_locs (0 = unlimited).
+    """
+    slug = _city_to_slug(city)
+    sitemap_urls: list[str] = []
+
+    # Check robots.txt first, then fall back to common paths
+    try:
+        r = await client.get(f"{BASE_URL}/robots.txt", timeout=10)
+        if r.status_code == 200:
+            for line in r.text.splitlines():
+                if line.lower().startswith("sitemap:"):
+                    sitemap_urls.insert(0, line.split(":", 1)[1].strip())
+    except Exception:
+        pass
+    sitemap_urls += [
+        f"{BASE_URL}/sitemap.xml",
+        f"{BASE_URL}/sitemap_index.xml",
+        f"{BASE_URL}/sitemap-luggage-storage.xml",
+    ]
+
+    stashpoint_urls: list[str] = []
+
+    for smap_url in sitemap_urls:
+        if not smap_url:
+            continue
+        try:
+            r = await client.get(smap_url, timeout=15)
+            if r.status_code != 200:
+                continue
+            root = ET.fromstring(r.text)
+
+            # Sitemap index → drill into child sitemaps
+            children = root.findall("sm:sitemap/sm:loc", _SITEMAP_NS)
+            if children:
+                for child_loc in children:
+                    child_url = child_loc.text or ""
+                    if not ("luggage" in child_url or "stash" in child_url.lower()):
+                        continue
+                    try:
+                        cr = await client.get(child_url, timeout=15)
+                        if cr.status_code != 200:
+                            continue
+                        cr_root = ET.fromstring(cr.text)
+                        for url_el in cr_root.findall("sm:url/sm:loc", _SITEMAP_NS):
+                            u = url_el.text or ""
+                            if f"/{slug}/" in u and "/luggage-storage/" in u:
+                                stashpoint_urls.append(u)
+                    except Exception:
+                        continue
+            else:
+                # Regular sitemap
+                for url_el in root.findall("sm:url/sm:loc", _SITEMAP_NS):
+                    u = url_el.text or ""
+                    if f"/{slug}/" in u and "/luggage-storage/" in u:
+                        stashpoint_urls.append(u)
+
+            if stashpoint_urls:
+                print(f"  [Stasher] Sitemap: found {len(stashpoint_urls)} URLs for {city}")
+                break
+        except Exception as e:
+            print(f"  [Stasher] Sitemap fetch failed ({smap_url}): {e}")
+            continue
+
+    if max_locs and len(stashpoint_urls) > max_locs:
+        stashpoint_urls = stashpoint_urls[:max_locs]
+    return stashpoint_urls
+
+
+def _extract_price_from_html(html: str) -> tuple[float, str]:
+    """
+    Try to find a price in raw HTML / __NEXT_DATA__ text.
+    Returns (price, currency) or (0.0, '').
+    """
+    # Try strict /day pattern first
+    for m in _SP_PRICE_RE.finditer(html):
+        sym, amt = m.group(1), m.group(2)
+        price = float(amt)
+        if price > 0:
+            return price, CURRENCY_MAP.get(sym, "GBP")
+    # Loose "from £X.XX" fallback — skip tiny promo prices (< £1)
+    candidates: list[tuple[float, str]] = []
+    for m in _SP_FROM_RE.finditer(html):
+        sym, amt = m.group(1), m.group(2)
+        price = float(amt)
+        if price >= 1.0:
+            candidates.append((price, CURRENCY_MAP.get(sym, "GBP")))
+    if candidates:
+        # Return the highest price to avoid promo banners
+        return max(candidates, key=lambda x: x[0])
+    return 0.0, ""
+
+
+async def _fetch_via_sitemap(city: str, scraped_at: datetime, max_locs: int) -> list[PriceRecord]:
+    """
+    Fetch individual stashpoint pages via sitemap, then scrape each for
+    name + price from __NEXT_DATA__ or page body.
+    """
+    headers = _make_headers()
+    async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=20) as client:
+        urls = await _find_stashpoint_urls_from_sitemap(client, city, max_locs)
+        if not urls:
+            return []
+
+        records: list[PriceRecord] = []
+        for url in urls:
+            try:
+                r = await client.get(url, timeout=20)
+                if r.status_code != 200:
+                    continue
+
+                html = r.text
+
+                # Try __NEXT_DATA__ first
+                name = ""
+                price, currency = 0.0, ""
+
+                m = _NEXT_DATA_RE.search(html)
+                if m:
+                    try:
+                        nd = json.loads(m.group(1))
+                        pp = nd.get("props", {}).get("pageProps", {})
+                        # Common stashpoint page structures
+                        sp = (pp.get("stashpoint") or pp.get("location") or
+                              pp.get("venue") or pp.get("store") or {})
+                        if isinstance(sp, dict):
+                            name = (sp.get("name") or sp.get("title") or
+                                    sp.get("storeName") or "")
+                            price_val = (sp.get("price") or sp.get("dailyPrice") or
+                                         sp.get("pricePerDay") or sp.get("rate") or 0)
+                            if price_val:
+                                price = float(price_val)
+                                currency = sp.get("currency") or sp.get("currencyCode") or "GBP"
+                    except Exception:
+                        pass
+
+                # Fall back to regex on full HTML
+                if price == 0.0:
+                    price, currency = _extract_price_from_html(html)
+
+                # Derive name from URL slug if not found in data
+                if not name:
+                    url_slug = url.rstrip("/").split("/")[-1]
+                    name = url_slug.replace("-", " ").title()
+
+                if price > 0:
+                    print(f"  [Stasher] {name}: {currency}{price}/day (from {url})")
+                    records.append(PriceRecord(
+                        company="Stasher",
+                        city=city,
+                        location_name=name,
+                        address="",
+                        size="flat-rate",
+                        price=price,
+                        currency=currency or "GBP",
+                        price_unit="day",
+                        scraped_at=scraped_at,
+                    ))
+                else:
+                    print(f"  [Stasher] {name}: no price found at {url}")
+            except Exception as e:
+                print(f"  [Stasher] Error fetching {url}: {e}")
+                continue
+
+    return records
+
+
 async def _fetch_api_direct(city: str, scraped_at: datetime, max_locs: int) -> list[PriceRecord]:
     """
     Try Stasher's backend REST API directly — no browser needed.
@@ -715,7 +907,14 @@ async def scrape_city(
     """
     scraped_at = datetime.now(timezone.utc)
 
-    # Strategy 1: direct API (fast, no browser)
+    # Strategy 1a: sitemap → individual stashpoint pages via httpx (no browser, bypasses anti-bot)
+    print(f"[{city}] [Stasher] Trying sitemap scrape …")
+    records = await _fetch_via_sitemap(city, scraped_at, max_locations)
+    if records:
+        print(f"[{city}] [Stasher] Sitemap scrape succeeded — {len(records)} record(s)")
+        return records
+
+    # Strategy 1b: direct API (fast, no browser)
     print(f"[{city}] [Stasher] Trying direct API …")
     records = await _fetch_api_direct(city, scraped_at, max_locations)
     if records:
