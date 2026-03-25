@@ -731,22 +731,22 @@ def _extract_price_from_html(html: str) -> tuple[float, str]:
     Try to find a price in raw HTML / __NEXT_DATA__ text.
     Returns (price, currency) or (0.0, '').
     """
-    # Try strict /day pattern first
+    # Try strict /day pattern first — most reliable
     for m in _SP_PRICE_RE.finditer(html):
         sym, amt = m.group(1), m.group(2)
         price = float(amt)
         if price > 0:
             return price, CURRENCY_MAP.get(sym, "GBP")
-    # Loose "from £X.XX" fallback — skip tiny promo prices (< £1)
+    # Loose "from £X.XX" fallback — take the lowest valid price (starting price)
+    # Skip anything < £1 (promo banners like "from £0.50") or > £50 (unlikely)
     candidates: list[tuple[float, str]] = []
     for m in _SP_FROM_RE.finditer(html):
         sym, amt = m.group(1), m.group(2)
         price = float(amt)
-        if price >= 1.0:
+        if 1.0 <= price <= 50.0:
             candidates.append((price, CURRENCY_MAP.get(sym, "GBP")))
     if candidates:
-        # Return the highest price to avoid promo banners
-        return max(candidates, key=lambda x: x[0])
+        return min(candidates, key=lambda x: x[0])
     return 0.0, ""
 
 
