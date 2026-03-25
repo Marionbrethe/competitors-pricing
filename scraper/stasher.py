@@ -542,32 +542,63 @@ async def _dom_scrape_city(page: Page, city: str, delay: float, max_locs: int) -
 
 async def _trigger_search(page: Page, city: str, delay: float) -> bool:
     """
-    After navigating to a Stasher city page, click the search button to
-    load individual stashpoints (they are not present in the initial render).
-    Returns True if a search was triggered.
+    After navigating to a Stasher city page, trigger a search so the
+    stashpoint API call fires. Returns True if something was triggered.
     """
     await asyncio.sleep(1)
-    # Stasher's city page has a pre-filled search widget — just click submit
+
+    # Log all visible buttons for diagnosis
+    try:
+        buttons = await page.evaluate("""
+            () => Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'))
+                .filter(el => el.offsetParent !== null)
+                .map(el => ({ tag: el.tagName, type: el.type||'', text: el.innerText.trim().slice(0,40), cls: el.className.slice(0,60) }))
+        """)
+        if buttons:
+            print(f"  [Stasher] Visible buttons on page: {buttons[:8]}")
+        else:
+            print(f"  [Stasher] No visible buttons found on page")
+    except Exception:
+        pass
+
+    # Try explicit selectors first
     submit_selectors = [
         'button[type="submit"]',
+        'input[type="submit"]',
         'button[class*="search" i]',
         'button[class*="Search"]',
         '[data-testid*="search"] button',
+        '[data-testid*="submit"]',
         'form button',
-        'button[class*="btn" i][class*="primary" i]',
-        '[class*="search-bar"] button',
-        '[class*="SearchBar"] button',
+        '[role="button"][class*="search" i]',
+        'button[class*="btn"]',
+        'button',  # last resort: first button on page
     ]
     for sel in submit_selectors:
         try:
             btn = page.locator(sel).first
-            if await btn.is_visible(timeout=2_000):
+            if await btn.is_visible(timeout=1_500):
+                text = (await btn.inner_text(timeout=500)).strip()
                 await btn.click()
-                print(f"  [Stasher] Clicked search button ({sel})")
+                print(f"  [Stasher] Clicked button ({sel!r} text={text!r})")
                 await asyncio.sleep(delay + 2)
                 return True
         except Exception:
             continue
+
+    # Fallback: press Enter in any search input
+    for inp_sel in ('input[type="search"]', 'input[type="text"]', 'input'):
+        try:
+            inp = page.locator(inp_sel).first
+            if await inp.is_visible(timeout=1_500):
+                await inp.press("Enter")
+                print(f"  [Stasher] Pressed Enter in input ({inp_sel})")
+                await asyncio.sleep(delay + 2)
+                return True
+        except Exception:
+            continue
+
+    print(f"  [Stasher] Could not find any interactive element to trigger search")
     return False
 
 
